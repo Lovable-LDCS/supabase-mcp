@@ -10,17 +10,19 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 const app = express();
 
 /* ------------ CORS & basics ------------ */
-/**
- * Some MCP clients add headers like OpenAI-Beta, OpenAI-Organization, etc.
- * Mirror back whatever the browser requests on preflight so nothing gets blocked.
- */
 app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
+    // Mirror any requested headers so nothing gets blocked
     allowedHeaders: (req, cb) => {
       const reqHdrs = req.header("Access-Control-Request-Headers");
-      cb(null, reqHdrs ? reqHdrs : "Content-Type, Authorization, Accept, Cache-Control, Last-Event-ID, OpenAI-Beta, OpenAI-Organization, OpenAI-Project");
+      cb(
+        null,
+        reqHdrs
+          ? reqHdrs
+          : "Content-Type, Authorization, Accept, Cache-Control, Last-Event-ID, OpenAI-Beta, OpenAI-Organization, OpenAI-Project"
+      );
     },
     exposedHeaders: ["Content-Type"],
   })
@@ -29,10 +31,9 @@ app.use(
 // JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ Global preflight handler (no path string → bypass path-to-regexp)
+// Global preflight (no path string → avoids path-to-regexp entirely)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
-    // echo requested headers so the browser proceeds
     const reqHdrs = req.header("Access-Control-Request-Headers");
     if (reqHdrs) res.setHeader("Access-Control-Allow-Headers", reqHdrs);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -111,6 +112,12 @@ const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 // 1) Open SSE
 app.get("/sse", async (_req, res) => {
   try {
+    // Make SSE headers explicit (some proxies are picky)
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
     const transport = new SSEServerTransport("/messages", res);
     sseTransports[transport.sessionId] = transport;
     console.log(`[SSE] open  sessionId=${transport.sessionId}`);
@@ -127,7 +134,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — normalize to 200 OK, add debug logs for headers/body
+// 2) Post messages — strong diagnostics, normalize to 200
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -136,24 +143,23 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).send("No transport found for sessionId");
   }
 
-  // Debug: log a few important headers (trim noisy ones)
   const hdr = (name) => req.headers[name.toLowerCase()];
+  const bodyStr = JSON.stringify(req.body ?? null);
   console.log(
-    `[MSG] hdrs sessionId=${sessionId} content-type=${hdr("content-type") || "-"} openai-beta=${hdr("openai-beta") || "-"} origin=${hdr("origin") || "-"}`
+    `[MSG] hdrs sessionId=${sessionId} ct=${hdr("content-type") || "-"} beta=${hdr("openai-beta") || "-"} origin=${hdr("origin") || "-"} bytes=${Buffer.byteLength(bodyStr || "")}`
   );
 
   let finished = false;
   res.on("finish", () => (finished = true));
 
   try {
-    console.log(`[MSG] in   sessionId=${sessionId} bytes=${Buffer.byteLength(JSON.stringify(req.body) || "")}`);
     await transport.handlePostMessage(req, res, req.body);
 
+    // If SDK didn't finish the response, finish with 200
     if (!finished) {
       res.status(200).end();
       finished = true;
     } else if (res.statusCode === 202) {
-      // If SDK set 202, change to 200 before flush (best-effort)
       try { res.statusCode = 200; } catch {}
       console.warn(`[MSG] status adjusted → 200`);
     }
