@@ -1,4 +1,4 @@
-// server.js
+// server.js  (patch v3: force 200 on /messages + prove writeHead patch)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -28,10 +28,9 @@ app.use(
   })
 );
 
-// JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// Global preflight (no path → avoids path-to-regexp entirely)
+// Global preflight (no path string)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     const reqHdrs = req.header("Access-Control-Request-Headers");
@@ -112,7 +111,6 @@ const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 // 1) Open SSE
 app.get("/sse", async (_req, res) => {
   try {
-    // Explicit SSE headers (some proxies are picky)
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -134,7 +132,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — force 200 OK if SDK tries to send 202
+// 2) Post messages — force 200 OK; log proof that patch ran
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -143,15 +141,18 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).json({ error: "No transport found for sessionId" });
   }
 
-  // Patch writeHead so any 202 gets rewritten to 200 before headers go out.
+  // Patch writeHead before SDK writes anything
   const origWriteHead = res.writeHead;
+  let patchedFired = false;
   res.writeHead = function patchedWriteHead(statusCode, ...rest) {
-    // normalize 202 → 200
-    if (statusCode === 202) statusCode = 200;
+    if (statusCode === 202) {
+      patchedFired = true;
+      console.log("[MSG] writeHead patch: 202 → 200");
+      statusCode = 200;
+    }
     return origWriteHead.call(this, statusCode, ...rest);
   };
 
-  // Light diagnostics
   const hdr = (n) => req.headers[n.toLowerCase()];
   const bodyStr = JSON.stringify(req.body ?? null);
   console.log(
@@ -161,19 +162,25 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   try {
     await transport.handlePostMessage(req, res, req.body);
 
-    // If SDK didn’t finish, send a tiny body with 200.
+    // If SDK didn’t send anything, finish with 200 + tiny body
     if (!res.headersSent && !res.writableEnded) {
+      console.log("[MSG] fallback body → 200 {ok:true}");
       res.status(200).json({ ok: true });
     }
 
+    // Belt & suspenders: if patch didn’t fire but status is 202, flip it now
+    if (res.statusCode === 202) {
+      console.log("[MSG] post-check: status 202 → 200");
+      try { res.statusCode = 200; } catch {}
+    }
+
     console.log(
-      `[MSG] out  sessionId=${sessionId} status=${res.statusCode} sent=${res.headersSent} ended=${res.writableEnded}`
+      `[MSG] out  sessionId=${sessionId} status=${res.statusCode} sent=${res.headersSent} ended=${res.writableEnded} patchFired=${patchedFired}`
     );
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).json({ error: "Internal error" });
   } finally {
-    // restore just in case (not strictly necessary per-request)
     res.writeHead = origWriteHead;
   }
 });
@@ -186,6 +193,7 @@ app.get("/", (_req, res) => {
       branch: process.env.RENDER_GIT_BRANCH || null,
       commit: process.env.RENDER_GIT_COMMIT || null,
       deployId: process.env.RENDER_DEPLOY_ID || null,
+      patch: "v3",
     },
   });
 });
@@ -196,7 +204,7 @@ process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const port = Number(process.env.PORT || 10000);
 app.listen(port, () => {
-  console.log(`MCP listening on :${port}`);
+  console.log(`MCP listening on :${port}  (patch v3)`);
   console.log(
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
