@@ -20,6 +20,8 @@ app.use(
       "Accept",
       "Cache-Control",
       "Last-Event-ID",
+      // Important for ChatGPT MCP client:
+      "OpenAI-Beta",
     ],
     exposedHeaders: ["Content-Type"],
   })
@@ -119,7 +121,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages (sessionId query param from the transport)
+// 2) Post messages (sessionId is managed by the SSE transport)
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -128,7 +130,9 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).send("No transport found for sessionId");
   }
   try {
+    console.log(`[MSG] in   sessionId=${sessionId}`);
     await transport.handlePostMessage(req, res, req.body);
+    console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).send("Internal error");
