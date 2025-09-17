@@ -1,3 +1,4 @@
+// server.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -8,30 +9,32 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
 const app = express();
 
-// --- CORS: be explicit & permissive for ChatGPT connector ---
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Accept",
-    "Cache-Control",
-    "Last-Event-ID"
-  ],
-  exposedHeaders: ["Content-Type"],
-}));
+// --- CORS: permissive for ChatGPT connector ---
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "Cache-Control",
+      "Last-Event-ID",
+    ],
+    exposedHeaders: ["Content-Type"],
+  })
+);
 
 // Global JSON parser
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ FIX: valid catch-all preflight
-app.options("(.*)", (req, res) => res.sendStatus(204));
+// ✅ VALID catch-all preflight (no "*" anywhere)
+app.options("(.*)", (_req, res) => res.sendStatus(204));
 
-/* ---------------- Supabase client ---------------- */
+/* ---------------- Supabase ---------------- */
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY,
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_KEY || "",
   { auth: { persistSession: false } }
 );
 
@@ -44,7 +47,7 @@ server.registerTool(
     title: "List table rows",
     description: "Fetch rows from a table with limit/offset.",
     inputSchema: z.object({
-      table: z.string(),
+      table: z.string().describe("Table name, e.g., public.users"),
       limit: z.number().int().min(1).max(500).default(50),
       offset: z.number().int().min(0).default(0),
     }),
@@ -54,14 +57,15 @@ server.registerTool(
       .from(table)
       .select("*")
       .range(offset, offset + limit - 1);
-
     if (error) {
       return {
         isError: true,
         content: [{ type: "text", text: `Supabase error: ${error.message}` }],
       };
     }
-    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }],
+    };
   }
 );
 
@@ -69,10 +73,11 @@ server.registerTool(
   "sql.query",
   {
     title: "SQL query (RPC)",
-    description: "Run a SQL query via Postgres function public.exec_sql (read-only).",
+    description:
+      "Run a SQL query via the Postgres function public.exec_sql (read-only).",
     inputSchema: z.object({
-      sql: z.string(),
-      params: z.array(z.any()).default([]),
+      sql: z.string().describe("SQL to execute (use SELECT for read-only)."),
+      params: z.array(z.any()).default([]).describe("Optional positional params"),
     }),
   },
   async ({ sql, params = [] }) => {
@@ -83,14 +88,17 @@ server.registerTool(
         content: [{ type: "text", text: `Supabase RPC error: ${error.message}` }],
       };
     }
-    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }],
+    };
   }
 );
 
-/* ---------------- SSE transport endpoints ---------------- */
-const sseTransports = {};
+/* ---------------- Legacy SSE transport endpoints ---------------- */
+const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 
-app.get("/sse", async (req, res) => {
+// 1) Open SSE
+app.get("/sse", async (_req, res) => {
   try {
     const transport = new SSEServerTransport("/messages", res);
     sseTransports[transport.sessionId] = transport;
@@ -104,34 +112,49 @@ app.get("/sse", async (req, res) => {
     await server.connect(transport);
   } catch (e) {
     console.error("[SSE] error", e);
+    if (!res.headersSent) res.status(500).end("SSE error");
   }
 });
 
-app.options("/messages", (req, res) => res.sendStatus(204));
-
+// 2) Post messages
+app.options("/messages", (_req, res) => res.sendStatus(204));
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
-  const sessionId = req.query.sessionId;
+  const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
-  if (!transport) {
+  if (!sessionId || !transport) {
     console.warn(`[MSG] no transport for sessionId=${sessionId}`);
     return res.status(400).send("No transport found for sessionId");
   }
   try {
-    console.log(`[MSG] in   sessionId=${sessionId}`);
     await transport.handlePostMessage(req, res, req.body);
-    console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).send("Internal error");
   }
 });
 
-/* ---------------- Health check ---------------- */
-app.get("/", (_, res) => res.json({ ok: true }));
+/* ---------------- Health & Version ---------------- */
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    // These envs are set by Render so we can prove which commit is running
+    git: {
+      branch: process.env.RENDER_GIT_BRANCH || null,
+      commit: process.env.RENDER_GIT_COMMIT || null,
+      deployId: process.env.RENDER_DEPLOY_ID || null,
+    },
+  });
+});
 
 /* ---------------- Start ---------------- */
 process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const port = Number(process.env.PORT || 10000);
-app.listen(port, () => console.log(`MCP listening on :${port}`));
+app.listen(port, () => {
+  console.log(`MCP listening on :${port}`);
+  console.log(
+    `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
+  );
+});
+
