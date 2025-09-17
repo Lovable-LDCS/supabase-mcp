@@ -20,7 +20,7 @@ app.use(
       "Accept",
       "Cache-Control",
       "Last-Event-ID",
-      // Important for ChatGPT’s MCP client
+      // ChatGPT MCP client sends this header:
       "OpenAI-Beta",
     ],
     exposedHeaders: ["Content-Type"],
@@ -30,7 +30,7 @@ app.use(
 // JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ Preflight handler WITHOUT any path (bypasses path-to-regexp entirely)
+// ✅ Global preflight handler (no path string → avoids path-to-regexp entirely)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -121,7 +121,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages (force 200 OK if SDK leaves 202)
+// 2) Post messages — normalize to 200 OK if SDK leaves 202/unfinished
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -130,7 +130,6 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).send("No transport found for sessionId");
   }
 
-  // Track whether SDK wrote the response
   let finished = false;
   res.on("finish", () => (finished = true));
 
@@ -138,13 +137,14 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     console.log(`[MSG] in   sessionId=${sessionId}`);
     await transport.handlePostMessage(req, res, req.body);
 
-    // If SDK didn't send anything or left 202, normalize to 200
     if (!finished) {
+      // SDK didn't send a body/finish the response — finish with 200
       res.status(200).end();
       finished = true;
     } else if (res.statusCode === 202) {
-      // Can't change status after finish, but we can log it for visibility
-      console.warn(`[MSG] status=202 (client may expect 200)`);
+      // Some SDKs reply 202; set header so proxies/browsers aren't confused
+      try { res.status(200); } catch {}
+      console.warn(`[MSG] status=202 → client may expect 200`);
     }
 
     console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
@@ -177,3 +177,4 @@ app.listen(port, () => {
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
 });
+
