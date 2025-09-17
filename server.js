@@ -8,12 +8,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
 const app = express();
+app.disable("x-powered-by");
 
 /* ------------ CORS & basics ------------ */
 app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
+    // Mirror any requested headers so nothing gets blocked
     allowedHeaders: (req, cb) => {
       const reqHdrs = req.header("Access-Control-Request-Headers");
       cb(
@@ -133,7 +135,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — if SDK doesn't write a response, send {ok:true}
+// 2) Post messages — only send fallback if nothing was sent
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -142,26 +144,25 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).json({ error: "No transport found for sessionId" });
   }
 
+  // Light diagnostics
   const hdr = (n) => req.headers[n.toLowerCase()];
   const bodyStr = JSON.stringify(req.body ?? null);
   console.log(
     `[MSG] hdrs sessionId=${sessionId} ct=${hdr("content-type") || "-"} beta=${hdr("openai-beta") || "-"} origin=${hdr("origin") || "-"} bytes=${Buffer.byteLength(bodyStr || "")}`
   );
 
-  let finished = false;
-  res.on("finish", () => (finished = true));
-
   try {
+    // Let the SDK handle the message. It may send/finish the response.
     await transport.handlePostMessage(req, res, req.body);
 
-    // If SDK didn't finish the response, return a tiny JSON payload
-    if (!finished) {
+    // After the SDK returns, only write if nothing has been sent yet.
+    if (!res.headersSent && !res.writableEnded) {
       res.status(200).json({ ok: true });
-      finished = true;
     }
-    // If SDK left 202, still fine; some clients don’t care. We won't override now.
 
-    console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
+    console.log(
+      `[MSG] out  sessionId=${sessionId} status=${res.statusCode} sent=${res.headersSent} ended=${res.writableEnded}`
+    );
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).json({ error: "Internal error" });
