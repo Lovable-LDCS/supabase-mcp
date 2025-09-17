@@ -7,8 +7,26 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+
+// --- CORS: be explicit & permissive for ChatGPT connector ---
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "Cache-Control",
+    "Last-Event-ID"
+  ],
+  exposedHeaders: ["Content-Type"],
+}));
+
+// Global JSON parser; bump size in case payloads get large
+app.use(express.json({ limit: "5mb" }));
+
+// Quick preflight path for safety
+app.options("*", (req, res) => res.sendStatus(204));
 
 /* ---------------- Auth disabled for connector testing ---------------- */
 app.use((req, res, next) => next());
@@ -21,12 +39,8 @@ const supabase = createClient(
 );
 
 /* ---------------- MCP Server & Tools ---------------- */
-const server = new McpServer({
-  name: "supabase-mcp",
-  version: "1.0.0"
-});
+const server = new McpServer({ name: "supabase-mcp", version: "1.0.0" });
 
-/** Tool: list rows from a table */
 server.registerTool(
   "db.rows",
   {
@@ -35,8 +49,8 @@ server.registerTool(
     inputSchema: z.object({
       table: z.string().describe("Table name, e.g., public.users"),
       limit: z.number().int().min(1).max(500).default(50),
-      offset: z.number().int().min(0).default(0)
-    })
+      offset: z.number().int().min(0).default(0),
+    }),
   },
   async ({ table, limit = 50, offset = 0 }) => {
     const { data, error } = await supabase
@@ -47,71 +61,82 @@ server.registerTool(
     if (error) {
       return {
         isError: true,
-        content: [{ type: "text", text: `Supabase error: ${error.message}` }]
+        content: [{ type: "text", text: `Supabase error: ${error.message}` }],
       };
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }]
-    };
+    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
   }
 );
 
-/** Tool: run SQL via RPC helper (add exec_sql in DB) */
 server.registerTool(
   "sql.query",
   {
     title: "SQL query (RPC)",
-    description:
-      "Run a SQL query via the Postgres function public.exec_sql (read-only recommended).",
+    description: "Run a SQL query via the Postgres function public.exec_sql (read-only).",
     inputSchema: z.object({
       sql: z.string().describe("SQL to execute (use SELECT for read-only)."),
-      params: z.array(z.any()).default([]).describe("Optional positional params")
-    })
+      params: z.array(z.any()).default([]).describe("Optional positional params"),
+    }),
   },
   async ({ sql, params = [] }) => {
     const { data, error } = await supabase.rpc("exec_sql", { sql, params });
     if (error) {
       return {
         isError: true,
-        content: [{ type: "text", text: `Supabase RPC error: ${error.message}` }]
+        content: [{ type: "text", text: `Supabase RPC error: ${error.message}` }],
       };
     }
-    return {
-      content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }]
-    };
+    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
   }
 );
 
 /* ---------------- Legacy SSE transport endpoints ---------------- */
-const sseTransports = {};
+const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 
 app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  sseTransports[transport.sessionId] = transport;
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    sseTransports[transport.sessionId] = transport;
+    console.log(`[SSE] open  sessionId=${transport.sessionId}`);
 
-  res.on("close", () => {
-    delete sseTransports[transport.sessionId];
-  });
+    res.on("close", () => {
+      console.log(`[SSE] close sessionId=${transport.sessionId}`);
+      delete sseTransports[transport.sessionId];
+    });
 
-  await server.connect(transport);
+    await server.connect(transport);
+  } catch (e) {
+    console.error("[SSE] error", e);
+  }
 });
 
-app.post("/messages", async (req, res) => {
+// Tighten parser specifically for /messages too (belt & suspenders)
+app.options("/messages", (req, res) => res.sendStatus(204));
+
+app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = sseTransports[sessionId];
   if (!transport) {
+    console.warn(`[MSG] no transport for sessionId=${sessionId}`);
     res.status(400).send("No transport found for sessionId");
     return;
   }
-  await transport.handlePostMessage(req, res, req.body);
+  try {
+    console.log(`[MSG] in   sessionId=${sessionId} bytes=${Buffer.byteLength(JSON.stringify(req.body) || "")}`);
+    await transport.handlePostMessage(req, res, req.body);
+    console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
+  } catch (e) {
+    console.error("[MSG] error", e);
+    if (!res.headersSent) res.status(500).send("Internal error");
+  }
 });
 
 /* ---------------- Health check ---------------- */
 app.get("/", (_, res) => res.json({ ok: true }));
 
 /* ---------------- Start ---------------- */
+process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
+
 const port = Number(process.env.PORT || 10000);
-app.listen(port, () => {
-  console.log(`MCP listening on :${port}`);
-});
+app.listen(port, () => console.log(`MCP listening on :${port}`));
