@@ -10,19 +10,18 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 const app = express();
 
 /* ------------ CORS & basics ------------ */
+/**
+ * Some MCP clients add headers like OpenAI-Beta, OpenAI-Organization, etc.
+ * Mirror back whatever the browser requests on preflight so nothing gets blocked.
+ */
 app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Accept",
-      "Cache-Control",
-      "Last-Event-ID",
-      // ChatGPT MCP client sends this header:
-      "OpenAI-Beta",
-    ],
+    allowedHeaders: (req, cb) => {
+      const reqHdrs = req.header("Access-Control-Request-Headers");
+      cb(null, reqHdrs ? reqHdrs : "Content-Type, Authorization, Accept, Cache-Control, Last-Event-ID, OpenAI-Beta, OpenAI-Organization, OpenAI-Project");
+    },
     exposedHeaders: ["Content-Type"],
   })
 );
@@ -30,9 +29,16 @@ app.use(
 // JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ Global preflight handler (no path string → avoids path-to-regexp entirely)
+// ✅ Global preflight handler (no path string → bypass path-to-regexp)
 app.use((req, res, next) => {
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  if (req.method === "OPTIONS") {
+    // echo requested headers so the browser proceeds
+    const reqHdrs = req.header("Access-Control-Request-Headers");
+    if (reqHdrs) res.setHeader("Access-Control-Allow-Headers", reqHdrs);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    return res.sendStatus(204);
+  }
   next();
 });
 
@@ -121,7 +127,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — normalize to 200 OK if SDK leaves 202/unfinished
+// 2) Post messages — normalize to 200 OK, add debug logs for headers/body
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -130,21 +136,26 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).send("No transport found for sessionId");
   }
 
+  // Debug: log a few important headers (trim noisy ones)
+  const hdr = (name) => req.headers[name.toLowerCase()];
+  console.log(
+    `[MSG] hdrs sessionId=${sessionId} content-type=${hdr("content-type") || "-"} openai-beta=${hdr("openai-beta") || "-"} origin=${hdr("origin") || "-"}`
+  );
+
   let finished = false;
   res.on("finish", () => (finished = true));
 
   try {
-    console.log(`[MSG] in   sessionId=${sessionId}`);
+    console.log(`[MSG] in   sessionId=${sessionId} bytes=${Buffer.byteLength(JSON.stringify(req.body) || "")}`);
     await transport.handlePostMessage(req, res, req.body);
 
     if (!finished) {
-      // SDK didn't send a body/finish the response — finish with 200
       res.status(200).end();
       finished = true;
     } else if (res.statusCode === 202) {
-      // Some SDKs reply 202; set header so proxies/browsers aren't confused
-      try { res.status(200); } catch {}
-      console.warn(`[MSG] status=202 → client may expect 200`);
+      // If SDK set 202, change to 200 before flush (best-effort)
+      try { res.statusCode = 200; } catch {}
+      console.warn(`[MSG] status adjusted → 200`);
     }
 
     console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
@@ -177,4 +188,5 @@ app.listen(port, () => {
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
 });
+
 
