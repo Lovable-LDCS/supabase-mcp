@@ -14,7 +14,6 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    // Mirror any requested headers so nothing gets blocked
     allowedHeaders: (req, cb) => {
       const reqHdrs = req.header("Access-Control-Request-Headers");
       cb(
@@ -31,7 +30,7 @@ app.use(
 // JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// Global preflight (no path string → avoids path-to-regexp entirely)
+// Global preflight (no path → avoids path-to-regexp entirely)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     const reqHdrs = req.header("Access-Control-Request-Headers");
@@ -106,13 +105,13 @@ server.registerTool(
   }
 );
 
-/* ------------ Legacy SSE transport endpoints ------------ */
+/* ------------ SSE transport endpoints ------------ */
 const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 
 // 1) Open SSE
 app.get("/sse", async (_req, res) => {
   try {
-    // Make SSE headers explicit (some proxies are picky)
+    // Be explicit for picky proxies
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -134,16 +133,16 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — strong diagnostics, normalize to 200
+// 2) Post messages — if SDK doesn't write a response, send {ok:true}
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
   if (!sessionId || !transport) {
     console.warn(`[MSG] no transport for sessionId=${sessionId}`);
-    return res.status(400).send("No transport found for sessionId");
+    return res.status(400).json({ error: "No transport found for sessionId" });
   }
 
-  const hdr = (name) => req.headers[name.toLowerCase()];
+  const hdr = (n) => req.headers[n.toLowerCase()];
   const bodyStr = JSON.stringify(req.body ?? null);
   console.log(
     `[MSG] hdrs sessionId=${sessionId} ct=${hdr("content-type") || "-"} beta=${hdr("openai-beta") || "-"} origin=${hdr("origin") || "-"} bytes=${Buffer.byteLength(bodyStr || "")}`
@@ -155,19 +154,17 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   try {
     await transport.handlePostMessage(req, res, req.body);
 
-    // If SDK didn't finish the response, finish with 200
+    // If SDK didn't finish the response, return a tiny JSON payload
     if (!finished) {
-      res.status(200).end();
+      res.status(200).json({ ok: true });
       finished = true;
-    } else if (res.statusCode === 202) {
-      try { res.statusCode = 200; } catch {}
-      console.warn(`[MSG] status adjusted → 200`);
     }
+    // If SDK left 202, still fine; some clients don’t care. We won't override now.
 
     console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
   } catch (e) {
     console.error("[MSG] error", e);
-    if (!res.headersSent) res.status(500).send("Internal error");
+    if (!res.headersSent) res.status(500).json({ error: "Internal error" });
   }
 });
 
@@ -194,5 +191,6 @@ app.listen(port, () => {
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
 });
+
 
 
