@@ -20,7 +20,7 @@ app.use(
       "Accept",
       "Cache-Control",
       "Last-Event-ID",
-      // Important for ChatGPT MCP client:
+      // Important for ChatGPT’s MCP client
       "OpenAI-Beta",
     ],
     exposedHeaders: ["Content-Type"],
@@ -121,7 +121,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages (sessionId is managed by the SSE transport)
+// 2) Post messages (force 200 OK if SDK leaves 202)
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -129,9 +129,24 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     console.warn(`[MSG] no transport for sessionId=${sessionId}`);
     return res.status(400).send("No transport found for sessionId");
   }
+
+  // Track whether SDK wrote the response
+  let finished = false;
+  res.on("finish", () => (finished = true));
+
   try {
     console.log(`[MSG] in   sessionId=${sessionId}`);
     await transport.handlePostMessage(req, res, req.body);
+
+    // If SDK didn't send anything or left 202, normalize to 200
+    if (!finished) {
+      res.status(200).end();
+      finished = true;
+    } else if (res.statusCode === 202) {
+      // Can't change status after finish, but we can log it for visibility
+      console.warn(`[MSG] status=202 (client may expect 200)`);
+    }
+
     console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
   } catch (e) {
     console.error("[MSG] error", e);
