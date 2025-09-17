@@ -1,4 +1,4 @@
-// server.js  (patch v3: force 200 on /messages + prove writeHead patch)
+// server.js  (patch v4: force 200 and ensure non-empty JSON body on /messages)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -30,7 +30,7 @@ app.use(
 
 app.use(express.json({ limit: "5mb" }));
 
-// Global preflight (no path string)
+// Global preflight (no path string → avoids path-to-regexp)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     const reqHdrs = req.header("Access-Control-Request-Headers");
@@ -132,7 +132,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — force 200 OK; log proof that patch ran
+// 2) Post messages — force 200 and ensure a tiny JSON body
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -141,9 +141,15 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(400).json({ error: "No transport found for sessionId" });
   }
 
-  // Patch writeHead before SDK writes anything
+  // --- Interceptors: normalize headers + body --------------------------------
   const origWriteHead = res.writeHead;
+  const origWrite = res.write;
+  const origEnd = res.end;
+
   let patchedFired = false;
+  let bytesWritten = 0;
+
+  // Normalize 202 → 200
   res.writeHead = function patchedWriteHead(statusCode, ...rest) {
     if (statusCode === 202) {
       patchedFired = true;
@@ -153,6 +159,33 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     return origWriteHead.call(this, statusCode, ...rest);
   };
 
+  // Track body size
+  res.write = function patchedWrite(chunk, ...rest) {
+    if (chunk) bytesWritten += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+    return origWrite.call(this, chunk, ...rest);
+  };
+
+  // If SDK ends without a body, inject a tiny JSON body
+  res.end = function patchedEnd(chunk, ...rest) {
+    let localChunk = chunk;
+    if (!localChunk && bytesWritten === 0) {
+      const payload = JSON.stringify({ ok: true });
+      if (!res.getHeader("Content-Type")) {
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+      }
+      localChunk = Buffer.from(payload, "utf8");
+      bytesWritten = localChunk.length;
+      if (res.statusCode === 202) {
+        console.log("[MSG] end patch: status 202 → 200");
+        res.statusCode = 200;
+      }
+      console.log("[MSG] end patch: injected {ok:true}");
+    }
+    return origEnd.call(this, localChunk, ...rest);
+  };
+  // ---------------------------------------------------------------------------
+
+  // Light diagnostics
   const hdr = (n) => req.headers[n.toLowerCase()];
   const bodyStr = JSON.stringify(req.body ?? null);
   console.log(
@@ -162,26 +195,23 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   try {
     await transport.handlePostMessage(req, res, req.body);
 
-    // If SDK didn’t send anything, finish with 200 + tiny body
+    // If somehow nothing got sent, finish with 200 + tiny body (belt & suspenders)
     if (!res.headersSent && !res.writableEnded) {
       console.log("[MSG] fallback body → 200 {ok:true}");
       res.status(200).json({ ok: true });
     }
 
-    // Belt & suspenders: if patch didn’t fire but status is 202, flip it now
-    if (res.statusCode === 202) {
-      console.log("[MSG] post-check: status 202 → 200");
-      try { res.statusCode = 200; } catch {}
-    }
-
     console.log(
-      `[MSG] out  sessionId=${sessionId} status=${res.statusCode} sent=${res.headersSent} ended=${res.writableEnded} patchFired=${patchedFired}`
+      `[MSG] out  sessionId=${sessionId} status=${res.statusCode} sent=${res.headersSent} ended=${res.writableEnded} patchFired=${patchedFired} bodyBytes=${bytesWritten}`
     );
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).json({ error: "Internal error" });
   } finally {
+    // Restore (per-request)
     res.writeHead = origWriteHead;
+    res.write = origWrite;
+    res.end = origEnd;
   }
 });
 
@@ -193,7 +223,7 @@ app.get("/", (_req, res) => {
       branch: process.env.RENDER_GIT_BRANCH || null,
       commit: process.env.RENDER_GIT_COMMIT || null,
       deployId: process.env.RENDER_DEPLOY_ID || null,
-      patch: "v3",
+      patch: "v4",
     },
   });
 });
@@ -204,7 +234,7 @@ process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const port = Number(process.env.PORT || 10000);
 app.listen(port, () => {
-  console.log(`MCP listening on :${port}  (patch v3)`);
+  console.log(`MCP listening on :${port}  (patch v4)`);
   console.log(
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
