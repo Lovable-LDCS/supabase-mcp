@@ -1,3 +1,4 @@
+// server.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -6,37 +7,36 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
+/* ---------------- App & Middleware ---------------- */
 const app = express();
 
-// --- CORS: be explicit & permissive for ChatGPT connector ---
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Accept",
-    "Cache-Control",
-    "Last-Event-ID"
-  ],
-  exposedHeaders: ["Content-Type"],
-}));
+// Be explicit & permissive for ChatGPT connector
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "Cache-Control",
+      "Last-Event-ID",
+    ],
+    exposedHeaders: ["Content-Type"],
+  })
+);
 
-// Global JSON parser; bump size in case payloads get large
+// Global JSON parser with sane limit
 app.use(express.json({ limit: "5mb" }));
 
-// Quick preflight path for safety
-app.options("*", (req, res) => res.sendStatus(204));
+// Valid, catch-all preflight handler (no bare "*")
+app.options("(.*)", (req, res) => res.sendStatus(204));
 
-/* ---------------- Auth disabled for connector testing ---------------- */
-app.use((req, res, next) => next());
-
-/* ---------------- Supabase client ---------------- */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY,
-  { auth: { persistSession: false } }
-);
+/* ---------------- Supabase ---------------- */
+const { SUPABASE_URL, SUPABASE_KEY } = process.env;
+const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "", {
+  auth: { persistSession: false },
+});
 
 /* ---------------- MCP Server & Tools ---------------- */
 const server = new McpServer({ name: "supabase-mcp", version: "1.0.0" });
@@ -57,14 +57,17 @@ server.registerTool(
       .from(table)
       .select("*")
       .range(offset, offset + limit - 1);
-
     if (error) {
       return {
         isError: true,
         content: [{ type: "text", text: `Supabase error: ${error.message}` }],
       };
     }
-    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ rows: data }, null, 2) },
+      ],
+    };
   }
 );
 
@@ -72,7 +75,8 @@ server.registerTool(
   "sql.query",
   {
     title: "SQL query (RPC)",
-    description: "Run a SQL query via the Postgres function public.exec_sql (read-only).",
+    description:
+      "Run a SQL query via the Postgres function public.exec_sql (read-only).",
     inputSchema: z.object({
       sql: z.string().describe("SQL to execute (use SELECT for read-only)."),
       params: z.array(z.any()).default([]).describe("Optional positional params"),
@@ -86,13 +90,18 @@ server.registerTool(
         content: [{ type: "text", text: `Supabase RPC error: ${error.message}` }],
       };
     }
-    return { content: [{ type: "text", text: JSON.stringify({ rows: data }, null, 2) }] };
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ rows: data }, null, 2) },
+      ],
+    };
   }
 );
 
 /* ---------------- Legacy SSE transport endpoints ---------------- */
 const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 
+// 1) Client opens SSE stream here
 app.get("/sse", async (req, res) => {
   try {
     const transport = new SSEServerTransport("/messages", res);
@@ -107,22 +116,26 @@ app.get("/sse", async (req, res) => {
     await server.connect(transport);
   } catch (e) {
     console.error("[SSE] error", e);
+    if (!res.headersSent) res.status(500).end("SSE error");
   }
 });
 
-// Tighten parser specifically for /messages too (belt & suspenders)
-app.options("/messages", (req, res) => res.sendStatus(204));
-
+// 2) Client posts messages here, with ?sessionId=... (transport-managed)
+app.options("/messages", cors());
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
-  const sessionId = req.query.sessionId;
+  const sessionId = String(req.query.sessionId || "");
+  if (!sessionId) {
+    console.warn("[MSG] missing sessionId");
+    return res.status(400).send("Missing sessionId");
+  }
   const transport = sseTransports[sessionId];
   if (!transport) {
     console.warn(`[MSG] no transport for sessionId=${sessionId}`);
-    res.status(400).send("No transport found for sessionId");
-    return;
+    return res.status(400).send("No transport found for sessionId");
   }
   try {
-    console.log(`[MSG] in   sessionId=${sessionId} bytes=${Buffer.byteLength(JSON.stringify(req.body) || "")}`);
+    const bytes = Buffer.byteLength(JSON.stringify(req.body) || "");
+    console.log(`[MSG] in   sessionId=${sessionId} bytes=${bytes}`);
     await transport.handlePostMessage(req, res, req.body);
     console.log(`[MSG] out  sessionId=${sessionId} status=${res.statusCode}`);
   } catch (e) {
@@ -131,12 +144,25 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   }
 });
 
-/* ---------------- Health check ---------------- */
-app.get("/", (_, res) => res.json({ ok: true }));
+/* ---------------- Health ---------------- */
+app.get("/", (_req, res) => res.json({ ok: true }));
 
-/* ---------------- Start ---------------- */
+/* ---------------- Start & Shutdown ---------------- */
 process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const port = Number(process.env.PORT || 10000);
-app.listen(port, () => console.log(`MCP listening on :${port}`));
+const serverHttp = app.listen(port, () =>
+  console.log(`MCP listening on :${port}`)
+);
+
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    console.log(`[shutdown] ${sig} received`);
+    serverHttp.close(() => {
+      console.log("[shutdown] HTTP server closed");
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 8000).unref();
+  });
+}
