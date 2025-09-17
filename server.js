@@ -15,7 +15,6 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    // Mirror any requested headers so nothing gets blocked
     allowedHeaders: (req, cb) => {
       const reqHdrs = req.header("Access-Control-Request-Headers");
       cb(
@@ -113,7 +112,7 @@ const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 // 1) Open SSE
 app.get("/sse", async (_req, res) => {
   try {
-    // Be explicit for picky proxies
+    // Explicit SSE headers (some proxies are picky)
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -135,7 +134,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages — only send fallback if nothing was sent
+// 2) Post messages — force 200 OK if SDK tries to send 202
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -143,6 +142,14 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
     console.warn(`[MSG] no transport for sessionId=${sessionId}`);
     return res.status(400).json({ error: "No transport found for sessionId" });
   }
+
+  // Patch writeHead so any 202 gets rewritten to 200 before headers go out.
+  const origWriteHead = res.writeHead;
+  res.writeHead = function patchedWriteHead(statusCode, ...rest) {
+    // normalize 202 → 200
+    if (statusCode === 202) statusCode = 200;
+    return origWriteHead.call(this, statusCode, ...rest);
+  };
 
   // Light diagnostics
   const hdr = (n) => req.headers[n.toLowerCase()];
@@ -152,10 +159,9 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   );
 
   try {
-    // Let the SDK handle the message. It may send/finish the response.
     await transport.handlePostMessage(req, res, req.body);
 
-    // After the SDK returns, only write if nothing has been sent yet.
+    // If SDK didn’t finish, send a tiny body with 200.
     if (!res.headersSent && !res.writableEnded) {
       res.status(200).json({ ok: true });
     }
@@ -166,6 +172,9 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   } catch (e) {
     console.error("[MSG] error", e);
     if (!res.headersSent) res.status(500).json({ error: "Internal error" });
+  } finally {
+    // restore just in case (not strictly necessary per-request)
+    res.writeHead = origWriteHead;
   }
 });
 
