@@ -9,7 +9,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
 const app = express();
 
-// --- CORS: permissive for ChatGPT connector ---
+/* ------------ CORS & basics ------------ */
 app.use(
   cors({
     origin: "*",
@@ -25,20 +25,23 @@ app.use(
   })
 );
 
-// Global JSON parser
+// JSON parsing
 app.use(express.json({ limit: "5mb" }));
 
-// ✅ VALID catch-all preflight (no "*" anywhere)
-app.options("(.*)", (_req, res) => res.sendStatus(204));
+// ✅ Preflight handler WITHOUT any path (bypasses path-to-regexp entirely)
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-/* ---------------- Supabase ---------------- */
+/* ------------ Supabase ------------ */
 const supabase = createClient(
   process.env.SUPABASE_URL || "",
   process.env.SUPABASE_KEY || "",
   { auth: { persistSession: false } }
 );
 
-/* ---------------- MCP Server & Tools ---------------- */
+/* ------------ MCP server & tools ------------ */
 const server = new McpServer({ name: "supabase-mcp", version: "1.0.0" });
 
 server.registerTool(
@@ -94,7 +97,7 @@ server.registerTool(
   }
 );
 
-/* ---------------- Legacy SSE transport endpoints ---------------- */
+/* ------------ Legacy SSE transport endpoints ------------ */
 const sseTransports = /** @type {Record<string, SSEServerTransport>} */ ({});
 
 // 1) Open SSE
@@ -116,8 +119,7 @@ app.get("/sse", async (_req, res) => {
   }
 });
 
-// 2) Post messages
-app.options("/messages", (_req, res) => res.sendStatus(204));
+// 2) Post messages (sessionId query param from the transport)
 app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   const sessionId = String(req.query.sessionId || "");
   const transport = sseTransports[sessionId];
@@ -133,11 +135,10 @@ app.post("/messages", express.json({ limit: "5mb" }), async (req, res) => {
   }
 });
 
-/* ---------------- Health & Version ---------------- */
+/* ------------ Health & Version ------------ */
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
-    // These envs are set by Render so we can prove which commit is running
     git: {
       branch: process.env.RENDER_GIT_BRANCH || null,
       commit: process.env.RENDER_GIT_COMMIT || null,
@@ -146,7 +147,7 @@ app.get("/", (_req, res) => {
   });
 });
 
-/* ---------------- Start ---------------- */
+/* ------------ Start ------------ */
 process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
@@ -157,4 +158,3 @@ app.listen(port, () => {
     `[deploy] branch=${process.env.RENDER_GIT_BRANCH || "?"} commit=${(process.env.RENDER_GIT_COMMIT || "?").slice(0,7)}`
   );
 });
-
