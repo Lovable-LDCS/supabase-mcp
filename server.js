@@ -1,7 +1,6 @@
-// server.js — v6.5.8
-// - Robust CORS preflight: app.options('*', cors()) mirrors requested headers
-// - Logs Access-Control-Request-Headers on /messages preflight
-// - Keeps: SSE transport with (req,res), JSON-RPC fallback, request logging
+// server.js — v6.5.9
+// - Fix: Express v5/path-to-regexp v6 doesn't allow "*" route; use /.*/ for global OPTIONS
+// - Keep: robust CORS, SSE (req,res), JSON-RPC fallback, request logging
 
 import "dotenv/config";
 import express from "express";
@@ -11,30 +10,28 @@ import { Server } from "@modelcontextprotocol/sdk/server";
 
 const app = express();
 
-// CORS: let the middleware handle preflights and echo requested headers.
+// CORS: allow common methods and mirror requested headers on preflight
 app.use(cors({ origin: "*", methods: ["GET","POST","HEAD","OPTIONS"] }));
-app.options("*", cors()); // <-- key: echoes Access-Control-Request-Headers automatically
+app.options(/.*/, cors()); // <-- safe with path-to-regexp v6
 
 app.use(express.json());
 
 // Supabase env sanity
 createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// MCP server (tools come later)
+// MCP server shell
 const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
 );
 
-// Helper to ensure non-preflight responses are permissive too
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
-  // In non-preflight responses this header is optional, but harmless:
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Session-Id, Authorization, Accept");
 }
 
-// ---- SSE transport resolver (covers multiple SDK layouts) ----
+// ---- robust SSE transport resolver ----
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -60,7 +57,11 @@ async function getSSEServerTransport() {
 }
 
 // ---- /sse lane ----
-// Note: For GET /sse, do NOT write headers; the SDK handles them.
+// Preflight/probe for /sse still fine:
+app.options("/sse", (_req, res) => { setCors(res); res.sendStatus(204); });
+app.head("/sse",    (_req, res) => { setCors(res); res.status(200).end(); });
+
+// IMPORTANT: for GET /sse don't write headers; SDK handles them.
 app.get("/sse", async (req, res) => {
   setCors(res);
   console.log("[SSE] incoming GET", { ua: req.get("user-agent") });
@@ -70,7 +71,7 @@ app.get("/sse", async (req, res) => {
     return res.status(500).json({ error: "SSE transport not available", err: sse.err });
   }
   try {
-    const transport = new sse.ctor(req, res); // emits endpoint hint /sse?sessionId=...
+    const transport = new sse.ctor(req, res); // emits endpoint: /sse?sessionId=...
     await mcpServer.connect(transport);
     console.log("[SSE] connected via", sse.path);
   } catch (e) {
@@ -82,10 +83,8 @@ app.get("/sse", async (req, res) => {
 
 // ---- /messages (preflight + JSON-RPC) ----
 app.options("/messages", (req, res) => {
-  // cors() already mirrored incoming headers; add logging for visibility
   const asked = req.get("access-control-request-headers") || "<none>";
   console.log("[/messages] preflight, requested headers:", asked);
-  // Also ensure permissive headers are present (belt-and-suspenders)
   setCors(res);
   res.sendStatus(204);
 });
@@ -111,7 +110,7 @@ app.post("/messages", async (req, res) => {
       return res.status(200).json(out ?? {});
     }
 
-    // Fallbacks to satisfy connector creation
+    // Minimal fallbacks for connector creation
     if (method === "initialize") {
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -145,7 +144,7 @@ app.get("/messages", (_req, res) =>
 
 // Debug
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.8" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.9" })
 );
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -162,7 +161,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.8" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.9" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.8)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.9)`));
