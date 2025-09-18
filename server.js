@@ -1,9 +1,8 @@
-// server.js — v6.4
+// server.js — v6.5
 // - Loads .env automatically
 // - /messages always returns JSON (never empty)
-// - Robust SSE resolver for various SDK layouts
+// - Robust SSE resolver (tries .js subpaths first for SDK v1.18.x)
 // - /debug/sdk and /debug/env for quick checks
-// - TEMP: no custom MCP commands yet (we'll add the tool with the v1.18 API next)
 
 import "dotenv/config";
 import express from "express";
@@ -21,26 +20,35 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ----- MCP server (no tools yet; just the transport hookup) -----
+// ----- MCP server (no custom tools yet) -----
 const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
 );
 
-// Lazy/robust resolver for SSEServerTransport across SDK variants
+// Lazy/robust resolver for SSEServerTransport across SDK variants.
+// IMPORTANT: try `.js` subpaths first (needed for v1.18 export map).
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
+
   const candidates = [
-    "@modelcontextprotocol/sdk/server/sse",            // 1.18.x
-    "@modelcontextprotocol/sdk/server/transport/sse",  // older layout
-    "@modelcontextprotocol/sdk/transport/sse"          // some builds
+    "@modelcontextprotocol/sdk/server/sse.js",            // v1.18.x common
+    "@modelcontextprotocol/sdk/server/transport/sse.js",  // older layout w/ ext
+    "@modelcontextprotocol/sdk/transport/sse.js",         // some builds
+    "@modelcontextprotocol/sdk/server/sse",               // fallback (no ext)
+    "@modelcontextprotocol/sdk/server/transport/sse",     // fallback (no ext)
+    "@modelcontextprotocol/sdk/transport/sse"             // fallback (no ext)
   ];
+
   for (const p of candidates) {
     try {
       const m = await import(p);
       const ctor = m.SSEServerTransport || m.default || m.SSE;
-      if (ctor) { sseCache = { ok: true, path: p, ctor, err: [] }; return sseCache; }
+      if (ctor) {
+        sseCache = { ok: true, path: p, ctor, err: [] };
+        return sseCache;
+      }
       sseCache.err.push(`Found ${p} but no SSEServerTransport export`);
     } catch (e) {
       sseCache.err.push(`${p}: ${String(e).slice(0,180)}`);
@@ -53,7 +61,10 @@ async function getSSEServerTransport() {
 app.get("/sse", async (_req, res) => {
   console.log("[SSE] client connected");
   const sse = await getSSEServerTransport();
-  if (!sse.ok) return res.status(500).json({ error: "SSE transport not available", err: sse.err });
+  if (!sse.ok) {
+    console.error("[SSE] transport resolve failed:", sse.err.join(" | "));
+    return res.status(500).json({ error: "SSE transport not available", err: sse.err });
+  }
   const transport = new sse.ctor("/sse", res);
   await mcpServer.connect(transport);
 });
@@ -71,6 +82,7 @@ app.use((req, res, next) => {
 
   const _write = res.write.bind(res);
   const _end = res.end.bind(res);
+
   res.write = (chunk, ...args) => {
     if (chunk) bodyBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
     return _write(chunk, ...args);
@@ -85,19 +97,23 @@ app.use((req, res, next) => {
     }
     return _end(chunk, ...args);
   };
+
   const _json = res.json.bind(res);
   res.json = (obj) => { const s = JSON.stringify(obj); bodyBytes += Buffer.byteLength(s); return _json(obj); };
+
   const _send = res.send.bind(res);
   res.send = (body) => {
     const s = (typeof body === "string" || Buffer.isBuffer(body)) ? body : JSON.stringify(body);
     bodyBytes += Buffer.isBuffer(s) ? s.length : Buffer.byteLength(String(s));
     return _send(body);
   };
+
   const _writeHead = res.writeHead.bind(res);
   res.writeHead = (code, ...args) => {
-    if (code !== 200) { statusCode = 200; return _writeHead(200, ...args); }
+    if (code !== 200) { console.log(`[MSG] writeHead patch: ${code} → 200`); statusCode = 200; return _writeHead(200, ...args); }
     statusCode = code; return _writeHead(code, ...args);
   };
+
   res.on("finish", () => console.log(`[MSG] out sessionId=${sessionId} status=${statusCode} bodyBytes=${bodyBytes}`));
   next();
 });
@@ -109,7 +125,7 @@ app.all("/messages", (_req, res) => {
 
 // Debug endpoints
 app.get("/debug/env", (_req, res) => {
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.4" });
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5" });
 });
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -126,7 +142,6 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Start server
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.4" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.4)`));
-
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5)`));
