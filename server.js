@@ -1,6 +1,7 @@
-// server.js — v6.5.3
-// - Fix: let SDK write SSE headers on GET /sse (no duplicate headers)
-// - Keeps robust SSE resolver, /messages JSON-RPC handler, and debug endpoints
+// server.js — v6.5.4
+// - Fix: construct SSE transport with (req, res) for current SDK
+// - Keep: SDK owns SSE headers on GET /sse (no duplicate writeHead)
+// - Extras: clearer logging around connect()
 
 import "dotenv/config";
 import express from "express";
@@ -12,16 +13,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ----- Supabase env sanity (will throw if missing) -----
+// ----- Supabase env sanity -----
 createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ----- MCP server (we’ll add tools next) -----
+// ----- MCP server -----
 const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
 );
 
-// ===== Robust SSE transport resolver (covers SDK v1.18.x shapes) =====
+// ===== Robust SSE transport resolver =====
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -31,16 +32,19 @@ async function getSSEServerTransport() {
     "@modelcontextprotocol/sdk/transport/sse.js",
     "@modelcontextprotocol/sdk/server/sse",
     "@modelcontextprotocol/sdk/server/transport/sse",
-    "@modelcontextprotocol/sdk/transport/sse"
+    "@modelcontextprotocol/sdk/transport/sse",
   ];
   for (const p of candidates) {
     try {
       const m = await import(p);
       const ctor = m.SSEServerTransport || m.default || m.SSE;
-      if (ctor) { sseCache = { ok: true, path: p, ctor, err: [] }; return sseCache; }
+      if (ctor) {
+        sseCache = { ok: true, path: p, ctor, err: [] };
+        return sseCache;
+      }
       sseCache.err.push(`Found ${p} but no SSEServerTransport export`);
     } catch (e) {
-      sseCache.err.push(`${p}: ${String(e).slice(0,180)}`);
+      sseCache.err.push(`${p}: ${String(e).slice(0, 180)}`);
     }
   }
   return sseCache;
@@ -53,26 +57,31 @@ function setCors(res) {
 }
 
 // ===== /sse lane =====
+app.options("/sse", (_req, res) => { setCors(res); res.sendStatus(204); });
+app.head("/sse",    (_req, res) => { setCors(res); res.status(200).end(); });
 
-// Preflights/probes (fine to send headers here)
-app.options("/sse", (req, res) => { setCors(res); res.sendStatus(204); });
-app.head("/sse",    (req, res) => { setCors(res); res.status(200).end(); });
-
-// IMPORTANT: for GET /sse do NOT send headers yourself.
-// The SDK’s SSE transport will do that.
+// IMPORTANT: do NOT call res.writeHead/res.status on GET. Let the SDK do it.
 app.get("/sse", async (req, res) => {
   setCors(res);
-  console.log("[SSE] client connected");
+  console.log("[SSE] incoming GET", { ua: req.get("user-agent") });
   const sse = await getSSEServerTransport();
   if (!sse.ok) {
     console.error("[SSE] transport resolve failed:", sse.err.join(" | "));
     return res.status(500).json({ error: "SSE transport not available", err: sse.err });
   }
-  const transport = new sse.ctor("/sse", res);
-  await mcpServer.connect(transport);
+  try {
+    const transport = new sse.ctor(req, res); // <-- change here
+    await mcpServer.connect(transport);
+    console.log("[SSE] connected via", sse.path);
+  } catch (e) {
+    console.error("[SSE] connect error:", e);
+    // If headers aren’t sent yet, return a JSON error; otherwise just end.
+    if (!res.headersSent) return res.status(500).json({ error: String(e).slice(0, 300) });
+    try { res.end(); } catch {}
+  }
 });
 
-// ===== /messages lane (JSON-RPC handoff to SDK) =====
+// ===== /messages lane (JSON-RPC) =====
 app.post("/messages", async (req, res) => {
   try {
     setCors(res);
@@ -97,14 +106,13 @@ app.post("/messages", async (req, res) => {
   }
 });
 
-// Optional GET for quick smoke tests
 app.get("/messages", (_req, res) =>
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } })
 );
 
 // ===== Debug =====
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.3" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.4" })
 );
 
 app.get("/debug/sdk", async (_req, res) => {
@@ -122,7 +130,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.3" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.4" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.3)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.4)`));
