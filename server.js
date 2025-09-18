@@ -3,7 +3,7 @@ import cors from "cors";
 
 const app = express();
 const port = process.env.PORT || 10000;
-const PATCH = "v6.9.9";
+const PATCH = "v6.10.0";
 
 /* --------- Dynamic CORS (covers preflight) ---------- */
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ??
@@ -34,6 +34,28 @@ app.get("/debug/env", (_req, res) =>
   res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: PATCH })
 );
 
+/* ------------- Minimal SSE stream (for chat runtime) ------------- */
+app.get("/sse", (req, res) => {
+  // CORS echo for GET as well
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+
+  // A small hint event and keepalives so Cloudflare/Render won’t close it
+  res.write("event: endpoint\n");
+  res.write("data: /sse\n\n");
+  const iv = setInterval(() => { res.write(": keepalive\n\n"); }, 20000);
+
+  req.on("close", () => { clearInterval(iv); });
+});
+
 /* ------------- Actions (REST) ------------- */
 const ACTION_SCHEMA = {
   type: "object",
@@ -49,7 +71,7 @@ const ACTIONS = [{
   title: "Search",
   description: "Search across your data (stub).",
   parameters: ACTION_SCHEMA,
-  input_schema: ACTION_SCHEMA   // keep for older clients
+  input_schema: ACTION_SCHEMA
 }];
 
 function noStore(res){
@@ -78,8 +100,7 @@ app.post("/actions/call", (req, res) => {
   return res.json({ content: [{ type: "text", text }] });
 });
 
-/* ------------- JSON-RPC over /sse (HTTP POST) ------------- */
-/* The UI sometimes uses this to probe capabilities. */
+/* ------------- JSON-RPC shim over /sse (HTTP POST) ------------- */
 app.post("/sse", (req, res) => {
   noStore(res);
   const body = req.body || {};
@@ -96,6 +117,7 @@ app.post("/sse", (req, res) => {
       }
     });
   }
+  if (method === "notifications/initialized") return respond({ result: {} });
   if (method === "tools/list")   return respond({ result: { tools: [] } });
   if (method === "actions/list") return respond({ result: { actions: ACTIONS } });
 
