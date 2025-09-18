@@ -1,8 +1,8 @@
-// server.js — v6.5.1
+// server.js — v6.5.2
 // - Loads .env automatically
-// - /messages always returns non-empty JSON (guard)
-// - SSE transport resolver (tries .js subpaths first)
-// - Adds HEAD/OPTIONS for /sse with CORS headers (for connector preflight)
+// - Guard ensures /messages always returns JSON
+// - Robust SSE resolver (tries .js subpaths first)
+// - Adds CORS + explicit SSE headers + logs for HEAD/OPTIONS/GET
 // - /debug endpoints
 
 import "dotenv/config";
@@ -12,33 +12,32 @@ import { createClient } from "@supabase/supabase-js";
 import { Server } from "@modelcontextprotocol/sdk/server";
 
 const app = express();
-app.use(cors());                // Access-Control-Allow-Origin: *
+app.use(cors());
 app.use(express.json());
 
-// ----- Supabase (not used yet, but envs are validated by the lib) -----
+// ----- Supabase (not used yet) -----
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ----- MCP server (we’ll add real tools next) -----
+// ----- MCP server -----
 const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
 );
 
-// Robust resolver for SSEServerTransport across SDK variants.
-// IMPORTANT: try `.js` subpaths first (needed for v1.18 export map).
+// ----- SSE resolver (works across SDK builds) -----
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
   const candidates = [
-    "@modelcontextprotocol/sdk/server/sse.js",            // v1.18.x common
-    "@modelcontextprotocol/sdk/server/transport/sse.js",  // some builds
-    "@modelcontextprotocol/sdk/transport/sse.js",         // some builds
-    "@modelcontextprotocol/sdk/server/sse",               // fallback (no ext)
-    "@modelcontextprotocol/sdk/server/transport/sse",     // fallback (no ext)
-    "@modelcontextprotocol/sdk/transport/sse"             // fallback (no ext)
+    "@modelcontextprotocol/sdk/server/sse.js",
+    "@modelcontextprotocol/sdk/server/transport/sse.js",
+    "@modelcontextprotocol/sdk/transport/sse.js",
+    "@modelcontextprotocol/sdk/server/sse",
+    "@modelcontextprotocol/sdk/server/transport/sse",
+    "@modelcontextprotocol/sdk/transport/sse"
   ];
   for (const p of candidates) {
     try {
@@ -53,39 +52,55 @@ async function getSSEServerTransport() {
   return sseCache;
 }
 
-// Simple CORS helper for non-GET preflight
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
 }
 
-// Preflight for connectors that probe /sse
+// --- Preflight helpers for connector UIs ---
 app.options("/sse", (req, res) => {
   setCors(res);
-  return res.sendStatus(204);   // No Content
+  console.log(`[SSE] OPTIONS from ${req.headers["user-agent"] || "unknown"}`);
+  res.sendStatus(204);
 });
 
-// Some environments issue HEAD first
 app.head("/sse", (req, res) => {
   setCors(res);
-  return res.status(200).end();
+  // Advertise SSE content-type even on HEAD so UIs feel confident
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  console.log(`[SSE] HEAD from ${req.headers["user-agent"] || "unknown"}`);
+  res.status(200).end();
 });
 
-// SSE endpoint for MCP
-app.get("/sse", async (_req, res) => {
-  console.log("[SSE] client connected");
+// --- Main SSE endpoint ---
+app.get("/sse", async (req, res) => {
   setCors(res);
+  // Set classic SSE headers up-front (some clients validate before first byte)
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // avoid proxy buffering
+  res.flushHeaders?.();
+
+  console.log(`[SSE] GET connect ua=${req.headers["user-agent"] || "unknown"}`);
+
   const sse = await getSSEServerTransport();
   if (!sse.ok) {
     console.error("[SSE] transport resolve failed:", sse.err.join(" | "));
     return res.status(500).json({ error: "SSE transport not available", err: sse.err });
   }
   const transport = new sse.ctor("/sse", res);
-  await mcpServer.connect(transport);
+  try {
+    await mcpServer.connect(transport);
+  } catch (e) {
+    console.error("[SSE] connect error:", e);
+    // If connect throws, report as JSON so the UI shows a reason
+    if (!res.headersSent) res.status(500).json({ error: "connect failed", message: String(e) });
+  }
 });
 
-// Guard so /messages always returns JSON (even if a framework swallows body)
+// Ensure /messages always emits a JSON body
 app.use((req, res, next) => {
   if (req.path !== "/messages") return next();
 
@@ -98,7 +113,6 @@ app.use((req, res, next) => {
 
   const _write = res.write.bind(res);
   const _end = res.end.bind(res);
-
   res.write = (chunk, ...args) => {
     if (chunk) bodyBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
     return _write(chunk, ...args);
@@ -113,36 +127,31 @@ app.use((req, res, next) => {
     }
     return _end(chunk, ...args);
   };
-
   const _json = res.json.bind(res);
   res.json = (obj) => { const s = JSON.stringify(obj); bodyBytes += Buffer.byteLength(s); return _json(obj); };
-
   const _send = res.send.bind(res);
   res.send = (body) => {
     const s = (typeof body === "string" || Buffer.isBuffer(body)) ? body : JSON.stringify(body);
     bodyBytes += Buffer.isBuffer(s) ? s.length : Buffer.byteLength(String(s));
     return _send(body);
   };
-
   const _writeHead = res.writeHead.bind(res);
   res.writeHead = (code, ...args) => {
     if (code !== 200) { console.log(`[MSG] writeHead patch: ${code} → 200`); statusCode = 200; return _writeHead(200, ...args); }
     statusCode = code; return _writeHead(code, ...args);
   };
-
   res.on("finish", () => console.log(`[MSG] out sessionId=${sessionId} status=${statusCode} bodyBytes=${bodyBytes}`));
   next();
 });
 
-// Always-valid JSON for POST/GET /messages
 app.all("/messages", (_req, res) => {
   setCors(res);
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } });
 });
 
-// Debug endpoints
+// Debug
 app.get("/debug/env", (_req, res) => {
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.1" });
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.5.2" });
 });
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -159,7 +168,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.1" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.5.2" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.1)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.5.2)`));
