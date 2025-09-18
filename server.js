@@ -5,14 +5,14 @@ const app = express();
 const port = process.env.PORT || 10000;
 const PATCH = "v6.10.0";
 
-/* --------- Dynamic CORS (covers preflight) ---------- */
+// ---- Dynamic CORS (GET/POST/OPTIONS) ----
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ??
   "https://chat.openai.com,https://chatgpt.com")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                // curl / server-to-server
+    if (!origin) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
@@ -28,15 +28,14 @@ app.use((req,res,next)=>{ res.setHeader("Vary","Origin"); next(); });
 app.use(cors(corsOptions));
 app.use(express.json());
 
-/* ------------- Diagnostics ------------- */
+// ---- Diagnostics ----
 app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: PATCH }));
 app.get("/debug/env", (_req, res) =>
   res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: PATCH })
 );
 
-/* ------------- Minimal SSE stream (for chat runtime) ------------- */
+// ---- Minimal SSE stream (chat expects this) ----
 app.get("/sse", (req, res) => {
-  // CORS echo for GET as well
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -48,15 +47,13 @@ app.get("/sse", (req, res) => {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
 
-  // A small hint event and keepalives so Cloudflare/Render won’t close it
   res.write("event: endpoint\n");
   res.write("data: /sse\n\n");
   const iv = setInterval(() => { res.write(": keepalive\n\n"); }, 20000);
-
   req.on("close", () => { clearInterval(iv); });
 });
 
-/* ------------- Actions (REST) ------------- */
+// ---- Actions (REST), unchanged behavior ----
 const ACTION_SCHEMA = {
   type: "object",
   properties: {
@@ -88,10 +85,8 @@ app.get("/messages/actions/list", actionsList);
 app.post("/actions/call", (req, res) => {
   noStore(res);
   const body = req.body || {};
-  const name = body.name;
+  if (body.name !== "search") return res.status(404).json({ error: "Unknown action" });
   const args = body.arguments || {};
-  if (name !== "search") return res.status(404).json({ error: "Unknown action" });
-
   const q = (args.query || "").toString();
   const topK = Number.isInteger(args.topK) ? args.topK : 3;
   const text = 'Search results for "' + q.replace(/"/g, '\\"') + '" (stub)\n'
@@ -100,7 +95,7 @@ app.post("/actions/call", (req, res) => {
   return res.json({ content: [{ type: "text", text }] });
 });
 
-/* ------------- JSON-RPC shim over /sse (HTTP POST) ------------- */
+// ---- JSON-RPC shim over /sse (HTTP POST) ----
 app.post("/sse", (req, res) => {
   noStore(res);
   const body = req.body || {};
@@ -124,7 +119,6 @@ app.post("/sse", (req, res) => {
   return respond({ error: { code: -32601, message: "Method not found" }});
 });
 
-/* ------------- Start ------------- */
 app.listen(port, () => {
   console.log("MCP server listening on port " + port + " (patch " + PATCH + ")");
 });
