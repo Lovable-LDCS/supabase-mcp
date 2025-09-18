@@ -1,6 +1,6 @@
-// server.js — v6.8.2
-// - Force initialize to include actions capability (avoid SDK default that omits actions)
-// - Keep: SSE GET via SDK, POST on /sse & /messages, explicit preflights, actions+tools stubs
+// server.js — v6.9.0
+// - NEW: REST Actions shim: /actions, /actions/list, /actions/call (+ OPTIONS preflights)
+// - KEEP: JSON-RPC over /sse and /messages (tools/*, actions/*), SSE GET via SDK, notifications ack, permissive CORS.
 
 import "dotenv/config";
 import express from "express";
@@ -12,8 +12,10 @@ const app = express();
 app.use(cors({ origin: "*", methods: ["GET","POST","HEAD","OPTIONS"] }));
 app.use(express.json());
 
+// Supabase sanity (not yet used by stub)
 createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// MCP core
 const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
@@ -27,6 +29,7 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Session-Id, Authorization, Accept");
 }
 
+// --------- Resolve SSE transport across SDK layouts ----------
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -49,9 +52,10 @@ async function getSSEServerTransport() {
   return sseCache;
 }
 
-// ----- /sse preflights + GET (SDK headers) -----
-app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight headers:", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204);});
+// -------------------- /sse (SSE + JSON-RPC) --------------------
+app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight headers:", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
 app.head("/sse", (_req,res)=>{ setCors(res); res.status(200).end(); });
+
 app.get("/sse", async (req,res)=>{
   setCors(res);
   console.log("[SSE] incoming GET", { ua: req.get("user-agent") });
@@ -61,7 +65,7 @@ app.get("/sse", async (req,res)=>{
   catch(e){ console.error("[SSE] connect error:", e); if(!res.headersSent) return res.status(500).json({ error:String(e).slice(0,300) }); try{res.end();}catch{} }
 });
 
-// ----- shared schema/defs -----
+// -------------------- Shared schemas/defs --------------------
 const SEARCH_INPUT_SCHEMA = {
   type:"object",
   properties:{
@@ -85,7 +89,7 @@ const SEARCH_ACTION_DEF = {
   parameters: SEARCH_INPUT_SCHEMA
 };
 
-// ----- JSON-RPC handler for both /messages and /sse -----
+// -------------------- JSON-RPC handler --------------------
 async function handleJsonRpc(req,res){
   try{
     setCors(res);
@@ -102,7 +106,7 @@ async function handleJsonRpc(req,res){
       return res.sendStatus(204);
     }
 
-    // **Force our initialize** so actions are always advertised
+    // Force initialize to always advertise actions
     if(method === "initialize"){
       return res.status(200).json({
         jsonrpc:"2.0",
@@ -115,7 +119,7 @@ async function handleJsonRpc(req,res){
       });
     }
 
-    // Prefer SDK for other methods if available
+    // Prefer SDK helpers for other methods if available
     if(typeof mcpServer.handleHTTP === "function"){
       const out = await mcpServer.handleHTTP(body, { sessionId: sid !== "<none>" ? sid : undefined });
       if(out) return res.status(200).json(out);
@@ -124,12 +128,11 @@ async function handleJsonRpc(req,res){
       if(out) return res.status(200).json(out);
     }
 
-    // ----- Fallbacks -----
-    if(method === "tools/list"){
-      return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
-    }
+    // Fallbacks
+    if(method === "tools/list")  return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
     if(method === "tools/call"){
-      const name = body.params?.name; const args = body.params?.arguments || {};
+      const { name } = body.params || {};
+      const args = body.params?.arguments || {};
       if(name === "search"){
         const q = String(args.query || "").trim();
         const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
@@ -139,11 +142,10 @@ async function handleJsonRpc(req,res){
       return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:`Tool ${name} not found` }});
     }
 
-    if(method === "actions/list"){
-      return res.status(200).json({ jsonrpc:"2.0", id, result:{ actions:[SEARCH_ACTION_DEF] }});
-    }
+    if(method === "actions/list") return res.status(200).json({ jsonrpc:"2.0", id, result:{ actions:[SEARCH_ACTION_DEF] }});
     if(method === "actions/call"){
-      const name = body.params?.name; const args = body.params?.arguments || {};
+      const { name } = body.params || {};
+      const args = body.params?.arguments || {};
       if(name === "search"){
         const q = String(args.query || "").trim();
         const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
@@ -153,7 +155,6 @@ async function handleJsonRpc(req,res){
       return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:`Action ${name} not found` }});
     }
 
-    // default
     return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:`Method ${method} not found` }});
   }catch(e){
     console.error(`[${req.path}] error:`, e);
@@ -161,16 +162,43 @@ async function handleJsonRpc(req,res){
   }
 }
 
-app.options("/messages", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/messages] preflight headers:", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204);});
+// Bind JSON-RPC
+app.options("/messages", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/messages] preflight headers:", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
 app.post("/messages", handleJsonRpc);
 app.post("/sse", handleJsonRpc);
 
-app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
+// --------------- REST Actions shim (for the settings UI) ---------------
+function ackPreflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log(`[${path}] preflight headers:`, asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); }; }
 
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.8.2" }));
+app.options("/actions",        ackPreflight("/actions"));
+app.options("/actions/list",   ackPreflight("/actions/list"));
+app.options("/actions/call",   ackPreflight("/actions/call"));
+
+app.get ("/actions",      (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)");   res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
+app.get ("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)");   res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
+app.post("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:POST)");  res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
+app.post("/actions/call", (req,res)=>{
+  setCors(res);
+  console.log("[/actions] call (REST:POST)", { name: req.body?.name });
+  const name = req.body?.name;
+  const args = req.body?.arguments || {};
+  if(name === "search"){
+    const q = String(args.query || "").trim();
+    const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
+    const text = q ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}` : `Search (stub): no query provided.`;
+    return res.status(200).json({ content:[{ type:"text", text }] });
+  }
+  return res.status(404).json({ error:`Action ${name} not found` });
+});
+
+// ----------------------- Diagnostics -----------------------
+app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
+app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.0" }));
 app.get("/debug/sdk", async (_req,res)=>{ const details={ node:process.versions.node }; try{ const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"}}); details.sdkVersion=pkg.default?.version||"unknown"; }catch{ details.sdkVersion="unavailable"; } const sse=await getSSEServerTransport(); details.sseResolved=sse.ok; details.ssePath=sse.path; details.errors=sse.err; res.json(details); });
 
+// ----------------------- Root + 404 ------------------------
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.8.2" }));
+app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.0" }));
 app.use((_req,res)=> res.status(404).json({ error:"Not found" }));
-app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.8.2)`));
+
+app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.9.0)`));
