@@ -8,7 +8,7 @@ const app = express();
 app.use(cors({ origin: "*", methods: ["GET","POST","HEAD","OPTIONS"] }));
 app.use(express.json());
 
-// create Supabase client (not yet used by stub search)
+// Supabase (not yet used by stub search)
 createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // MCP server (SDK)
@@ -41,10 +41,7 @@ async function getSSEServerTransport() {
     try {
       const m = await import(p);
       const ctor = m.SSEServerTransport || m.default || m.SSE;
-      if (ctor) {
-        sseCache = { ok:true, path:p, ctor, err:[] };
-        return sseCache;
-      }
+      if (ctor) { sseCache = { ok:true, path:p, ctor, err:[] }; return sseCache; }
       sseCache.err.push("Found " + p + " but no SSEServerTransport export");
     } catch (e) {
       sseCache.err.push(p + ": " + String(e).slice(0,180));
@@ -72,7 +69,7 @@ app.get("/sse", async (req,res)=>{
   }
 });
 
-// ----------------- Shared schema/defs for search -----------------
+// ----------------- Shared schema/defs (search) -----------------
 const SEARCH_INPUT_SCHEMA = {
   type:"object",
   properties:{
@@ -81,7 +78,7 @@ const SEARCH_INPUT_SCHEMA = {
   },
   required:["query"]
 };
-const SEARCH_TOOL_DEF = { name:"search", description:"Simple text search (stub). Returns placeholder results; to be wired to Supabase.", input_schema: SEARCH_INPUT_SCHEMA };
+const SEARCH_TOOL_DEF   = { name:"search", description:"Simple text search (stub). Returns placeholder results; to be wired to Supabase.", input_schema: SEARCH_INPUT_SCHEMA };
 const SEARCH_ACTION_DEF = { name:"search", title:"Search", description:"Search across your data (stub).", input_schema: SEARCH_INPUT_SCHEMA, parameters: SEARCH_INPUT_SCHEMA };
 
 // --------------------- JSON-RPC handler ----------------------
@@ -101,7 +98,7 @@ async function handleJsonRpc(req,res){
       return res.sendStatus(204);
     }
 
-    // Always advertise actions in initialize
+    // Advertise capabilities
     if(method === "initialize"){
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -114,7 +111,7 @@ async function handleJsonRpc(req,res){
       });
     }
 
-    // Short-circuit tools/* so the SDK never returns an empty list
+    // Intercept tools/*
     if(method === "tools/list"){
       console.log("[" + req.path + "] tools/list -> 1 tool");
       return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
@@ -133,7 +130,7 @@ async function handleJsonRpc(req,res){
       return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:"Tool " + name + " not found" }});
     }
 
-    // Prefer SDK handling when available
+    // Prefer SDK for anything else
     if(typeof mcpServer.handleHTTP === "function"){
       const out = await mcpServer.handleHTTP(body, { sessionId: sid !== "<none>" ? sid : undefined });
       if(out) return res.status(200).json(out);
@@ -142,7 +139,7 @@ async function handleJsonRpc(req,res){
       if(out) return res.status(200).json(out);
     }
 
-    // Fallback: actions/*
+    // Fallbacks for actions/*
     if(method === "actions/list") return res.status(200).json({ jsonrpc:"2.0", id, result:{ actions:[SEARCH_ACTION_DEF] }});
     if(method === "actions/call"){
       const name = (body.params && body.params.name) || "";
@@ -183,15 +180,12 @@ function restListHandler(_req, res) {
   const result = { actions: [SEARCH_ACTION_DEF] };
   res.status(200).json({ ...result, jsonrpc: "2.0", id: 0, result });
 }
-
 function restCallHandler(name, args, res){
   if(name === "search"){
     const q = String(args.query || "").trim();
     const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
     const result = {
-      content:[{ type:"text", text: q
-        ? 'Search results for "' + q + '" (stub)\n- No database wired yet.\n- topK=' + topK
-        : "Search (stub): no query provided." }]
+      content:[{ type:"text", text: q ? 'Search results for "' + q + '" (stub)\n- No database wired yet.\n- topK=' + topK : "Search (stub): no query provided." }]
     };
     return res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result });
   }
@@ -212,9 +206,7 @@ app.head   ("/actions/call",   headOk);
 app.get ("/actions",       restListHandler);
 app.get ("/actions/list",  restListHandler);
 app.post("/actions/list",  restListHandler);
-
-// GET /actions/call?name=search&arguments={"query":"x","topK":2}
-app.get("/actions/call", (req,res)=>{
+app.get ("/actions/call", (req,res)=>{
   setCors(res);
   const name = String(req.query.name||"").trim();
   let args = {};
@@ -240,8 +232,13 @@ function wireActionsAliases(prefix) {
   app.head   (prefix + "/actions",      headOk);
   app.head   (prefix + "/actions/list", headOk);
   app.head   (prefix + "/actions/call", headOk);
+
+  // LIST handlers (GET + POST)  <-- v6.9.5 adds POST here
   app.get (prefix + "/actions",      restListHandler);
   app.get (prefix + "/actions/list", restListHandler);
+  app.post(prefix + "/actions/list", restListHandler);
+
+  // CALL handlers
   app.get (prefix + "/actions/call", (req,res)=>{
     setCors(res);
     const name = String(req.query.name||"").trim();
@@ -265,7 +262,7 @@ wireActionsAliases("/messages");
 
 // -------------------- diagnostics + root --------------------
 app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.4" }));
+app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.5" }));
 app.get("/debug/sdk", async (_req,res)=>{
   const details={ node:process.versions.node };
   try{
@@ -280,6 +277,6 @@ app.get("/debug/sdk", async (_req,res)=>{
 });
 
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.4" }));
+app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.5" }));
 app.use((_req,res)=> { setCors(res); res.status(404).json({ error:"Not found" }); });
-app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.4)"));
+app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.5)"));
