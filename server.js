@@ -1,6 +1,6 @@
-// server.js — v6.6.1
-// - Remove global OPTIONS wildcard; use explicit preflights for /sse and /messages
-// - Keep: SSE GET via SDK, JSON-RPC fallback, permissive CORS, path logging
+// server.js — v6.6.2
+// - Add protocolVersion to JSON-RPC initialize result (client expects this)
+// - Keep: SSE GET via SDK, POST /messages and POST /sse, explicit preflights, permissive CORS, path logging
 
 import "dotenv/config";
 import express from "express";
@@ -22,6 +22,9 @@ const mcpServer = new Server(
   { name: "supabase-mcp", version: "1.0.0" },
   { capabilities: {} }
 );
+
+// Report a modern protocol identifier; safe default for clients that require it.
+const PROTOCOL_VERSION = "2024-11-05";
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -80,7 +83,7 @@ app.get("/sse", async (req, res) => {
   }
 });
 
-// shared JSON-RPC handler
+// ---- Shared JSON-RPC handler (used by both /messages and /sse) ----
 async function handleJsonRpc(req, res) {
   try {
     setCors(res);
@@ -91,32 +94,48 @@ async function handleJsonRpc(req, res) {
     const body = req.body ?? {};
     const id = body.id ?? null;
 
+    // Prefer SDK helpers if present
     if (typeof mcpServer.handleHTTP === "function") {
       const sessionId = sid !== "<none>" ? sid : undefined;
       const out = await mcpServer.handleHTTP(body, { sessionId });
+      console.log(`[${req.path}] -> handled by SDK (HTTP)`);
       return res.status(200).json(out ?? {});
     }
     if (typeof mcpServer.handleRequest === "function") {
       const out = await mcpServer.handleRequest(body);
+      console.log(`[${req.path}] -> handled by SDK (handleRequest)`);
       return res.status(200).json(out ?? {});
     }
 
+    // --- Minimal fallbacks for connector creation ---
     if (method === "initialize") {
-      return res.status(200).json({
+      const payload = {
         jsonrpc: "2.0",
         id,
-        result: { serverInfo: { name: "supabase-mcp", version: "1.0.0" }, capabilities: {} }
-      });
-    }
-    if (method === "tools/list") {
-      return res.status(200).json({ jsonrpc: "2.0", id, result: { tools: [] } });
+        result: {
+          serverInfo: { name: "supabase-mcp", version: "1.0.0" },
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: {}          // no tools yet; we'll add next
+        }
+      };
+      console.log(`[${req.path}] -> 200 ${JSON.stringify(payload).slice(0, 140)}…`);
+      return res.status(200).json(payload);
     }
 
-    return res.status(200).json({
+    if (method === "tools/list") {
+      const payload = { jsonrpc: "2.0", id, result: { tools: [] } };
+      console.log(`[${req.path}] -> 200 ${JSON.stringify(payload).slice(0, 140)}…`);
+      return res.status(200).json(payload);
+    }
+
+    const errPayload = {
       jsonrpc: "2.0",
       id,
       error: { code: -32601, message: `Method ${method} not found` }
-    });
+    };
+    console.log(`[${req.path}] -> 200 ${JSON.stringify(errPayload).slice(0, 140)}…`);
+    return res.status(200).json(errPayload);
+
   } catch (e) {
     console.error(`[${req.path}] error:`, e);
     return res.status(200).json({
@@ -145,7 +164,7 @@ app.get("/messages", (_req, res) =>
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } })
 );
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.6.1" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.6.2" })
 );
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -162,7 +181,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.6.1" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.6.2" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.6.1)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.6.2)`));
