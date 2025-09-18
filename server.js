@@ -1,10 +1,4 @@
-// server.js — v6.9.1
-// - REST Actions shim now covers GET/POST/HEAD for /actions, /actions/list, /actions/call
-// - GET /actions/call supports ?name=&arguments=<json>
-// - Strong CORS + no-store caching hints
-// - Initialize always advertises actions { search:{} }
-// - Keeps JSON-RPC over /sse and /messages, SSE GET via SDK, notifications ack
-
+// server.js — v6.9.2
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -31,10 +25,11 @@ function setCors(res) {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
 }
 
-let sseCache = { ok: false, path: null, ctor: null, err: [] };
+// ---- resolve SSE transport across SDK layouts ----
+let sseCache = { ok:false, path:null, ctor:null, err:[] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
-  const candidates = [
+  const paths = [
     "@modelcontextprotocol/sdk/server/sse.js",
     "@modelcontextprotocol/sdk/server/transport/sse.js",
     "@modelcontextprotocol/sdk/transport/sse.js",
@@ -42,18 +37,20 @@ async function getSSEServerTransport() {
     "@modelcontextprotocol/sdk/server/transport/sse",
     "@modelcontextprotocol/sdk/transport/sse",
   ];
-  for (const p of candidates) {
+  for (const p of paths) {
     try {
       const m = await import(p);
       const ctor = m.SSEServerTransport || m.default || m.SSE;
-      if (ctor) { sseCache = { ok: true, path: p, ctor, err: [] }; return sseCache; }
+      if (ctor) { sseCache = { ok:true, path:p, ctor, err:[] }; return sseCache; }
       sseCache.err.push(`Found ${p} but no SSEServerTransport export`);
-    } catch (e) { sseCache.err.push(`${p}: ${String(e).slice(0,180)}`); }
+    } catch (e) {
+      sseCache.err.push(`${p}: ${String(e).slice(0,180)}`);
+    }
   }
   return sseCache;
 }
 
-/* ---------- SSE: preflights + GET (SDK) ---------- */
+/* ---------------------- SSE ---------------------- */
 app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
 app.head("/sse", (_req,res)=>{ setCors(res); res.status(200).end(); });
 app.get("/sse", async (req,res)=>{
@@ -65,7 +62,7 @@ app.get("/sse", async (req,res)=>{
   catch(e){ console.error("[SSE] connect error:", e); if(!res.headersSent) return res.status(500).json({ error:String(e).slice(0,300) }); try{res.end();}catch{} }
 });
 
-/* ---------- Shared schema/defs ---------- */
+/* ----------------- shared schema/defs ----------------- */
 const SEARCH_INPUT_SCHEMA = {
   type:"object",
   properties:{
@@ -74,22 +71,10 @@ const SEARCH_INPUT_SCHEMA = {
   },
   required:["query"]
 };
+const SEARCH_TOOL_DEF = { name:"search", description:"Simple text search (stub). Returns placeholder results; to be wired to Supabase.", input_schema: SEARCH_INPUT_SCHEMA };
+const SEARCH_ACTION_DEF = { name:"search", title:"Search", description:"Search across your data (stub).", input_schema: SEARCH_INPUT_SCHEMA, parameters: SEARCH_INPUT_SCHEMA };
 
-const SEARCH_TOOL_DEF = {
-  name:"search",
-  description:"Simple text search (stub). Returns placeholder results; to be wired to Supabase.",
-  input_schema: SEARCH_INPUT_SCHEMA
-};
-
-const SEARCH_ACTION_DEF = {
-  name:"search",
-  title:"Search",
-  description:"Search across your data (stub).",
-  input_schema: SEARCH_INPUT_SCHEMA,
-  parameters: SEARCH_INPUT_SCHEMA
-};
-
-/* ---------- JSON-RPC over /messages and /sse (POST) ---------- */
+/* ---------------- JSON-RPC handlers ---------------- */
 async function handleJsonRpc(req,res){
   try{
     setCors(res);
@@ -100,26 +85,26 @@ async function handleJsonRpc(req,res){
     const sid = req.get("x-session-id") || req.query.sessionId || "<none>";
     console.log(`[${req.path}]`, method, "sid=", sid);
 
-    // notifications: ack
+    // notifications → ack
     if(!hasId || id === null){
       if(method === "notifications/initialized"){ console.log(`[${req.path}] notification ack`); return res.sendStatus(204); }
       return res.sendStatus(204);
     }
 
-    // Always advertise actions in initialize
+    // always advertise actions here
     if(method === "initialize"){
       return res.status(200).json({
-        jsonrpc:"2.0",
+        jsonrpc: "2.0",
         id,
-        result:{
-          serverInfo:{ name:"supabase-mcp", version:"1.0.0" },
+        result: {
+          serverInfo: { name: "supabase-mcp", version: "1.0.0" },
           protocolVersion: PROTOCOL_VERSION,
-          capabilities:{ tools:{}, actions:{ search:{} } }
+          capabilities: { tools:{}, actions: { search:{} } }
         }
       });
     }
 
-    // Prefer SDK helpers otherwise
+    // prefer SDK if present
     if(typeof mcpServer.handleHTTP === "function"){
       const out = await mcpServer.handleHTTP(body, { sessionId: sid !== "<none>" ? sid : undefined });
       if(out) return res.status(200).json(out);
@@ -128,8 +113,8 @@ async function handleJsonRpc(req,res){
       if(out) return res.status(200).json(out);
     }
 
-    // Fallbacks
-    if(method === "tools/list")  return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
+    // fallbacks
+    if(method === "tools/list") return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
     if(method === "tools/call"){
       const { name } = body.params || {};
       const args = body.params?.arguments || {};
@@ -149,8 +134,8 @@ async function handleJsonRpc(req,res){
       if(name === "search"){
         const q = String(args.query || "").trim();
         const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
-        const text = q ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}` : `Search (stub): no query provided.`;
-        return res.status(200).json({ jsonrpc:"2.0", id, result:{ content:[{ type:"text", text }] }});
+        const result = { content:[{ type:"text", text: q ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}` : `Search (stub): no query provided.` }] };
+        return res.status(200).json({ jsonrpc:"2.0", id, result });
       }
       return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:`Action ${name} not found` }});
     }
@@ -161,12 +146,11 @@ async function handleJsonRpc(req,res){
     return res.status(200).json({ jsonrpc:"2.0", id:(req.body&&req.body.id)||null, error:{ code:-32000, message:String(e).slice(0,300) }});
   }
 }
-
 app.options("/messages", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/messages] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
 app.post("/messages", handleJsonRpc);
 app.post("/sse", handleJsonRpc);
 
-/* ---------- REST Actions shim (broad coverage) ---------- */
+/* ---------------- REST Actions shim (broad + dual-shape) ---------------- */
 function preflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log(`[${path}] preflight`, asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); }; }
 function headOk(_req,res){ setCors(res); res.status(200).end(); }
 
@@ -177,47 +161,41 @@ app.head("/actions", headOk);
 app.head("/actions/list", headOk);
 app.head("/actions/call", headOk);
 
-app.get("/actions", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)"); res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
-app.get("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)"); res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
-app.post("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:POST)"); res.status(200).json({ actions:[SEARCH_ACTION_DEF] }); });
+app.get("/actions", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)"); const result = { actions:[SEARCH_ACTION_DEF] }; res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result }); });
+app.get("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:GET)"); const result = { actions:[SEARCH_ACTION_DEF] }; res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result }); });
+app.post("/actions/list", (_req,res)=>{ setCors(res); console.log("[/actions] list (REST:POST)"); const result = { actions:[SEARCH_ACTION_DEF] }; res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result }); });
 
 // GET /actions/call?name=search&arguments={"query":"x","topK":2}
 app.get("/actions/call", (req,res)=>{
   setCors(res);
-  const name = String(req.query.name||"").trim();
-  let args = {};
-  if (typeof req.query.arguments === "string") {
-    try { args = JSON.parse(req.query.arguments); } catch { args = {}; }
-  }
+  let args = {}; const name = String(req.query.name||"").trim();
+  if (typeof req.query.arguments === "string") { try { args = JSON.parse(req.query.arguments); } catch { args = {}; } }
   console.log("[/actions] call (REST:GET)", { name });
   return restCallHandler(name, args, res);
 });
-
 app.post("/actions/call", (req,res)=>{
   setCors(res);
-  const name = req.body?.name;
-  const args = req.body?.arguments || {};
+  const name = req.body?.name; const args = req.body?.arguments || {};
   console.log("[/actions] call (REST:POST)", { name });
   return restCallHandler(name, args, res);
 });
-
 function restCallHandler(name, args, res){
   if(name === "search"){
     const q = String(args.query || "").trim();
     const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
-    const text = q ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}` : `Search (stub): no query provided.`;
-    return res.status(200).json({ content:[{ type:"text", text }] });
+    const result = { content:[{ type:"text", text: q ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}` : `Search (stub): no query provided.` }] };
+    return res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result });
   }
-  return res.status(404).json({ error:`Action ${name} not found` });
+  return res.status(404).json({ error:`Action ${name} not found`, jsonrpc:"2.0", id:0, errorRPC:{ code:-32601, message:`Action ${name} not found` } });
 }
 
-/* ---------- Diagnostics + root ---------- */
+/* ---------------- diagnostics + root ---------------- */
 app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.1" }));
+app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.2" }));
 app.get("/debug/sdk", async (_req,res)=>{ const details={ node:process.versions.node }; try{ const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"}}); details.sdkVersion=pkg.default?.version||"unknown"; }catch{ details.sdkVersion="unavailable"; } const sse=await getSSEServerTransport(); details.sseResolved=sse.ok; details.ssePath=sse.path; details.errors=sse.err; res.json(details); });
 
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.1" }));
+app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.2" }));
 app.use((_req,res)=> { setCors(res); res.status(404).json({ error:"Not found" }); });
 
-app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.9.1)`));
+app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.9.2)`));
