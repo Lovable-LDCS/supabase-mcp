@@ -18,8 +18,23 @@ const mcpServer = new Server(
 );
 const PROTOCOL_VERSION = "2024-11-05";
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// ---- dynamic CORS (echo Origin + credentials for ChatGPT UI) ----
+function setCors(req, res) {
+  const origin = req?.get?.("origin");
+  const allowList = [
+    /^https:\/\/chat\.openai\.com$/,
+    /^https:\/\/chatgpt\.com$/,
+    /^https:\/\/.*\.openai\.com$/
+  ];
+  const isAllowed = origin && allowList.some(rx => rx.test(origin));
+
+  if (isAllowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Session-Id, Authorization, Accept");
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -51,10 +66,10 @@ async function getSSEServerTransport() {
 }
 
 /* ----------------------- SSE endpoint --------------------- */
-app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
-app.head("/sse", (_req,res)=>{ setCors(res); res.status(200).end(); });
+app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(req,res); res.sendStatus(204); });
+app.head("/sse", (req,res)=>{ setCors(req,res); res.status(200).end(); });
 app.get("/sse", async (req,res)=>{
-  setCors(res);
+  setCors(req,res);
   console.log("[SSE] incoming GET", { ua: req.get("user-agent") });
   const sse = await getSSEServerTransport();
   if(!sse.ok) return res.status(500).json({ error:"SSE transport not available", err:sse.err });
@@ -84,7 +99,7 @@ const SEARCH_ACTION_DEF = { name:"search", title:"Search", description:"Search a
 /* ---------------------- JSON-RPC handler ------------------- */
 async function handleJsonRpc(req,res){
   try{
-    setCors(res);
+    setCors(req,res);
     const body = req.body ?? {};
     const method = body.method || "<no-method>";
     const hasId = Object.prototype.hasOwnProperty.call(body,"id");
@@ -159,18 +174,18 @@ async function handleJsonRpc(req,res){
     return res.status(200).json({ jsonrpc:"2.0", id:(req.body&&req.body.id)||null, error:{ code:-32000, message:String(e).slice(0,300) }});
   }
 }
-app.options("/messages", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/messages] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
+app.options("/messages", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/messages] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(req,res); res.sendStatus(204); });
 app.post("/messages", handleJsonRpc);
 app.post("/sse", handleJsonRpc);
 
 /* -------- REST Actions shim (+aliases under /sse and /messages) -------- */
-function preflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[" + path + "] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); }; }
-function headOk(_req,res){ setCors(res); res.status(200).end(); }
+function preflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[" + path + "] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(req,res); res.sendStatus(204); }; }
+function headOk(req,res){ setCors(req,res); res.status(200).end(); }
 
 function restListHandler(req, res) {
-  setCors(res);
+  setCors(req,res);
   console.log("[" + req.path + "] actions/list (REST)");
-  // v6.9.6: **pure REST** (no jsonrpc/id/result)
+  // pure REST
   res.status(200).json({ actions: [SEARCH_ACTION_DEF] });
 }
 function restCallHandler(name, args, req, res){
@@ -178,7 +193,6 @@ function restCallHandler(name, args, req, res){
   if(name === "search"){
     const q = String(args.query || "").trim();
     const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
-    // v6.9.6: **pure REST** (no jsonrpc/id/result)
     return res.status(200).json({
       content:[{ type:"text", text: q ? 'Search results for "' + q + '" (stub)\n- No database wired yet.\n- topK=' + topK : "Search (stub): no query provided." }]
     });
@@ -196,8 +210,8 @@ app.head   ("/actions/call",   headOk);
 app.get ("/actions",       restListHandler);
 app.get ("/actions/list",  restListHandler);
 app.post("/actions/list",  restListHandler);
-app.get ("/actions/call", (req,res)=>{ setCors(res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
-app.post("/actions/call", (req,res)=>{ setCors(res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
+app.get ("/actions/call", (req,res)=>{ setCors(req,res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
+app.post("/actions/call", (req,res)=>{ setCors(req,res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
 
 /* Aliases so clients that append to /sse or /messages also work */
 function wireActionsAliases(prefix) {
@@ -214,16 +228,16 @@ function wireActionsAliases(prefix) {
   app.post(prefix + "/actions/list", restListHandler);
 
   // CALL handlers
-  app.get (prefix + "/actions/call", (req,res)=>{ setCors(res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
-  app.post(prefix + "/actions/call", (req,res)=>{ setCors(res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
+  app.get (prefix + "/actions/call", (req,res)=>{ setCors(req,res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
+  app.post(prefix + "/actions/call", (req,res)=>{ setCors(req,res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
 }
 wireActionsAliases("/sse");
 wireActionsAliases("/messages");
 
 /* -------------------- diagnostics + root -------------------- */
-app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.6" }));
-app.get("/debug/sdk", async (_req,res)=>{
+app.get("/messages", (req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
+app.get("/debug/env", (req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.7" }));
+app.get("/debug/sdk", async (req,res)=>{
   const details={ node:process.versions.node };
   try{ const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"} }); details.sdkVersion=pkg.default?.version||"unknown"; }
   catch{ details.sdkVersion="unavailable"; }
@@ -233,6 +247,6 @@ app.get("/debug/sdk", async (_req,res)=>{
 });
 
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.6" }));
-app.use((_req,res)=> { setCors(res); res.status(404).json({ error:"Not found" }); });
-app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.6)"));
+app.get("/", (req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.7" }));
+app.use((req,res)=> { setCors(req,res); res.status(404).json({ error:"Not found" }); });
+app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.7)"));
