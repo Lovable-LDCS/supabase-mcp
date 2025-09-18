@@ -1,6 +1,6 @@
-// server.js — v6.6.0
-// - NEW: handle JSON-RPC on POST /sse (alias of /messages) + OPTIONS /sse preflight
-// - Keep: SSE GET (SDK writes headers), robust CORS, JSON-RPC fallback, request logging
+// server.js — v6.6.1
+// - Remove global OPTIONS wildcard; use explicit preflights for /sse and /messages
+// - Keep: SSE GET via SDK, JSON-RPC fallback, permissive CORS, path logging
 
 import "dotenv/config";
 import express from "express";
@@ -10,10 +10,8 @@ import { Server } from "@modelcontextprotocol/sdk/server";
 
 const app = express();
 
-// CORS
+// CORS for all responses (simple)
 app.use(cors({ origin: "*", methods: ["GET","POST","HEAD","OPTIONS"] }));
-app.options(/.*/, cors()); // safe wildcard for Express/path-to-regexp v6
-
 app.use(express.json());
 
 // Supabase sanity
@@ -25,14 +23,13 @@ const mcpServer = new Server(
   { capabilities: {} }
 );
 
-// helper
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Session-Id, Authorization, Accept");
 }
 
-// ---- SSE transport resolver (unchanged) ----
+// ---- SSE transport resolver ----
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -57,27 +54,23 @@ async function getSSEServerTransport() {
   return sseCache;
 }
 
-// ---- SSE (GET) ----
-app.options("/sse", (req, res) => {  // explicit preflight + logging
+// ---- /sse: preflight + GET (SDK owns headers) + POST (JSON-RPC alias) ----
+app.options("/sse", (req, res) => {
   const asked = req.get("access-control-request-headers") || "<none>";
   console.log("[/sse] preflight, requested headers:", asked);
+  if (asked) res.setHeader("Access-Control-Allow-Headers", asked);
   setCors(res);
   res.sendStatus(204);
 });
-
 app.head("/sse", (_req, res) => { setCors(res); res.status(200).end(); });
 
-// IMPORTANT: do not write headers yourself on GET; the SDK will.
 app.get("/sse", async (req, res) => {
   setCors(res);
   console.log("[SSE] incoming GET", { ua: req.get("user-agent") });
   const sse = await getSSEServerTransport();
-  if (!sse.ok) {
-    console.error("[SSE] transport resolve failed:", sse.err.join(" | "));
-    return res.status(500).json({ error: "SSE transport not available", err: sse.err });
-  }
+  if (!sse.ok) return res.status(500).json({ error: "SSE transport not available", err: sse.err });
   try {
-    const transport = new sse.ctor(req, res); // will emit endpoint hint
+    const transport = new sse.ctor(req, res); // emits endpoint: /sse?sessionId=...
     await mcpServer.connect(transport);
     console.log("[SSE] connected via", sse.path);
   } catch (e) {
@@ -87,7 +80,7 @@ app.get("/sse", async (req, res) => {
   }
 });
 
-// ---- Shared JSON-RPC handler (used by both /messages and /sse) ----
+// shared JSON-RPC handler
 async function handleJsonRpc(req, res) {
   try {
     setCors(res);
@@ -98,7 +91,6 @@ async function handleJsonRpc(req, res) {
     const body = req.body ?? {};
     const id = body.id ?? null;
 
-    // Prefer SDK helpers if present
     if (typeof mcpServer.handleHTTP === "function") {
       const sessionId = sid !== "<none>" ? sid : undefined;
       const out = await mcpServer.handleHTTP(body, { sessionId });
@@ -109,7 +101,6 @@ async function handleJsonRpc(req, res) {
       return res.status(200).json(out ?? {});
     }
 
-    // Minimal fallbacks (enough for connector creation)
     if (method === "initialize") {
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -136,29 +127,26 @@ async function handleJsonRpc(req, res) {
   }
 }
 
-// ---- /messages (canonical) ----
+// /messages canonical + explicit preflight
 app.options("/messages", (req, res) => {
   const asked = req.get("access-control-request-headers") || "<none>";
   console.log("[/messages] preflight, requested headers:", asked);
-  // Echo whatever the browser asked for to be maximally permissive
   if (asked) res.setHeader("Access-Control-Allow-Headers", asked);
   setCors(res);
   res.sendStatus(204);
 });
 app.post("/messages", handleJsonRpc);
 
-// ---- /sse (alias for JSON-RPC POST) ----
+// /sse alias for JSON-RPC POST
 app.post("/sse", handleJsonRpc);
 
-// Smoke test + debug
+// Smoke + debug
 app.get("/messages", (_req, res) =>
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } })
 );
-
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.6.0" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.6.1" })
 );
-
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
   try {
@@ -174,7 +162,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.6.0" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.6.1" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.6.0)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.6.1)`));
