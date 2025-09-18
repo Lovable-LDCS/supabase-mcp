@@ -25,7 +25,7 @@ function setCors(res) {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
 }
 
-// ---------- Resolve SSE transport across SDK layouts ----------
+/* -------- Resolve SSE transport across SDK layouts -------- */
 let sseCache = { ok:false, path:null, ctor:null, err:[] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -50,7 +50,7 @@ async function getSSEServerTransport() {
   return sseCache;
 }
 
-// ----------------------- SSE endpoint -----------------------
+/* ----------------------- SSE endpoint --------------------- */
 app.options("/sse", (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[/sse] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); });
 app.head("/sse", (_req,res)=>{ setCors(res); res.status(200).end(); });
 app.get("/sse", async (req,res)=>{
@@ -69,7 +69,7 @@ app.get("/sse", async (req,res)=>{
   }
 });
 
-// ----------------- Shared schema/defs (search) -----------------
+/* ---------------- Shared schema/defs (search) -------------- */
 const SEARCH_INPUT_SCHEMA = {
   type:"object",
   properties:{
@@ -81,7 +81,7 @@ const SEARCH_INPUT_SCHEMA = {
 const SEARCH_TOOL_DEF   = { name:"search", description:"Simple text search (stub). Returns placeholder results; to be wired to Supabase.", input_schema: SEARCH_INPUT_SCHEMA };
 const SEARCH_ACTION_DEF = { name:"search", title:"Search", description:"Search across your data (stub).", input_schema: SEARCH_INPUT_SCHEMA, parameters: SEARCH_INPUT_SCHEMA };
 
-// --------------------- JSON-RPC handler ----------------------
+/* ---------------------- JSON-RPC handler ------------------- */
 async function handleJsonRpc(req,res){
   try{
     setCors(res);
@@ -98,7 +98,7 @@ async function handleJsonRpc(req,res){
       return res.sendStatus(204);
     }
 
-    // Advertise capabilities
+    // Capabilities
     if(method === "initialize"){
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -163,40 +163,30 @@ app.options("/messages", (req,res)=>{ const asked=req.get("access-control-reques
 app.post("/messages", handleJsonRpc);
 app.post("/sse", handleJsonRpc);
 
-// ------------- REST Actions shim (+aliases under /sse and /messages) -------------
-function preflight(path){
-  return (req,res)=>{
-    const asked=req.get("access-control-request-headers")||"<none>";
-    console.log("[" + path + "] preflight", asked);
-    if(asked) res.setHeader("Access-Control-Allow-Headers", asked);
-    setCors(res);
-    res.sendStatus(204);
-  };
-}
+/* -------- REST Actions shim (+aliases under /sse and /messages) -------- */
+function preflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log("[" + path + "] preflight", asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); }; }
 function headOk(_req,res){ setCors(res); res.status(200).end(); }
 
-function restListHandler(_req, res) {
+function restListHandler(req, res) {
   setCors(res);
-  const result = { actions: [SEARCH_ACTION_DEF] };
-  res.status(200).json({ ...result, jsonrpc: "2.0", id: 0, result });
+  console.log("[" + req.path + "] actions/list (REST)");
+  // v6.9.6: **pure REST** (no jsonrpc/id/result)
+  res.status(200).json({ actions: [SEARCH_ACTION_DEF] });
 }
-function restCallHandler(name, args, res){
+function restCallHandler(name, args, req, res){
+  console.log("[" + req.path + "] actions/call (REST)", { name });
   if(name === "search"){
     const q = String(args.query || "").trim();
     const topK = Math.min(Math.max(parseInt(args.topK ?? 3,10)||3,1),10);
-    const result = {
+    // v6.9.6: **pure REST** (no jsonrpc/id/result)
+    return res.status(200).json({
       content:[{ type:"text", text: q ? 'Search results for "' + q + '" (stub)\n- No database wired yet.\n- topK=' + topK : "Search (stub): no query provided." }]
-    };
-    return res.status(200).json({ ...result, jsonrpc:"2.0", id:0, result });
+    });
   }
-  return res.status(404).json({
-    error:"Action " + name + " not found",
-    jsonrpc:"2.0", id:0,
-    errorRPC:{ code:-32601, message:"Action " + name + " not found" }
-  });
+  return res.status(404).json({ error:"Action " + name + " not found" });
 }
 
-// Root REST endpoints: /actions/*
+/* Root REST endpoints: /actions/* */
 app.options("/actions",        preflight("/actions"));
 app.options("/actions/list",   preflight("/actions/list"));
 app.options("/actions/call",   preflight("/actions/call"));
@@ -206,25 +196,10 @@ app.head   ("/actions/call",   headOk);
 app.get ("/actions",       restListHandler);
 app.get ("/actions/list",  restListHandler);
 app.post("/actions/list",  restListHandler);
-app.get ("/actions/call", (req,res)=>{
-  setCors(res);
-  const name = String(req.query.name||"").trim();
-  let args = {};
-  if (typeof req.query.arguments === "string") {
-    try { args = JSON.parse(req.query.arguments); } catch { args = {}; }
-  }
-  console.log("[/actions] call (REST:GET)", { name });
-  return restCallHandler(name, args, res);
-});
-app.post("/actions/call", (req,res)=>{
-  setCors(res);
-  const name = req.body?.name;
-  const args = req.body?.arguments || {};
-  console.log("[/actions] call (REST:POST)", { name });
-  return restCallHandler(name, args, res);
-});
+app.get ("/actions/call", (req,res)=>{ setCors(res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
+app.post("/actions/call", (req,res)=>{ setCors(res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
 
-// Aliases so clients that append to /sse or /messages also work
+/* Aliases so clients that append to /sse or /messages also work */
 function wireActionsAliases(prefix) {
   app.options(prefix + "/actions",      preflight(prefix + "/actions"));
   app.options(prefix + "/actions/list", preflight(prefix + "/actions/list"));
@@ -233,50 +208,31 @@ function wireActionsAliases(prefix) {
   app.head   (prefix + "/actions/list", headOk);
   app.head   (prefix + "/actions/call", headOk);
 
-  // LIST handlers (GET + POST)  <-- v6.9.5 adds POST here
+  // LIST handlers (GET + POST)
   app.get (prefix + "/actions",      restListHandler);
   app.get (prefix + "/actions/list", restListHandler);
   app.post(prefix + "/actions/list", restListHandler);
 
   // CALL handlers
-  app.get (prefix + "/actions/call", (req,res)=>{
-    setCors(res);
-    const name = String(req.query.name||"").trim();
-    let args = {};
-    if (typeof req.query.arguments === "string") {
-      try { args = JSON.parse(req.query.arguments); } catch { args = {}; }
-    }
-    console.log("[" + prefix + "] actions/call (REST:GET)", { name });
-    return restCallHandler(name, args, res);
-  });
-  app.post(prefix + "/actions/call", (req,res)=>{
-    setCors(res);
-    const name = req.body?.name;
-    const args = req.body?.arguments || {};
-    console.log("[" + prefix + "] actions/call (REST:POST)", { name });
-    return restCallHandler(name, args, res);
-  });
+  app.get (prefix + "/actions/call", (req,res)=>{ setCors(res); const name=String(req.query.name||"").trim(); let args={}; if(typeof req.query.arguments==="string"){ try{ args=JSON.parse(req.query.arguments); }catch{} } return restCallHandler(name,args,req,res); });
+  app.post(prefix + "/actions/call", (req,res)=>{ setCors(res); const name=req.body?.name; const args=req.body?.arguments||{}; return restCallHandler(name,args,req,res); });
 }
 wireActionsAliases("/sse");
 wireActionsAliases("/messages");
 
-// -------------------- diagnostics + root --------------------
+/* -------------------- diagnostics + root -------------------- */
 app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.5" }));
+app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.6" }));
 app.get("/debug/sdk", async (_req,res)=>{
   const details={ node:process.versions.node };
-  try{
-    const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"}});
-    details.sdkVersion=pkg.default?.version||"unknown";
-  }catch{
-    details.sdkVersion="unavailable";
-  }
+  try{ const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"} }); details.sdkVersion=pkg.default?.version||"unknown"; }
+  catch{ details.sdkVersion="unavailable"; }
   const sse=await getSSEServerTransport();
   details.sseResolved=sse.ok; details.ssePath=sse.path; details.errors=sse.err;
   res.json(details);
 });
 
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.5" }));
+app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.6" }));
 app.use((_req,res)=> { setCors(res); res.status(404).json({ error:"Not found" }); });
-app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.5)"));
+app.listen(port, ()=> console.log("MCP server listening on port " + port + " (patch v6.9.6)"));
