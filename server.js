@@ -3,7 +3,7 @@ import cors from "cors";
 
 const app = express();
 const port = process.env.PORT || 10000;
-const PATCH = "v6.10.0";
+const PATCH = "v6.10.1";
 
 // ---- Dynamic CORS (GET/POST/OPTIONS) ----
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ??
@@ -34,7 +34,7 @@ app.get("/debug/env", (_req, res) =>
   res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: PATCH })
 );
 
-// ---- Minimal SSE stream (chat expects this) ----
+// ---- Minimal SSE stream (needed by Chat) ----
 app.get("/sse", (req, res) => {
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
@@ -84,23 +84,26 @@ app.get("/messages/actions/list", actionsList);
 
 app.post("/actions/call", (req, res) => {
   noStore(res);
-  const body = req.body || {};
-  if (body.name !== "search") return res.status(404).json({ error: "Unknown action" });
-  const args = body.arguments || {};
+  return res.json(callSearch(req.body?.arguments || {}));
+});
+
+// ---- JSON-RPC shim over /sse (what the picker uses) ----
+function callSearch(argsRaw){
+  const args = argsRaw || {};
   const q = (args.query || "").toString();
   const topK = Number.isInteger(args.topK) ? args.topK : 3;
   const text = 'Search results for "' + q.replace(/"/g, '\\"') + '" (stub)\n'
              + '- No database wired yet.\n'
              + '- topK=' + topK;
-  return res.json({ content: [{ type: "text", text }] });
-});
+  return { content: [{ type: "text", text }] };
+}
 
-// ---- JSON-RPC shim over /sse (HTTP POST) ----
 app.post("/sse", (req, res) => {
   noStore(res);
   const body = req.body || {};
   const id = Object.prototype.hasOwnProperty.call(body,"id") ? body.id : null;
   const method = body.method || "";
+  const params = body.params || {};
   const respond = (obj) => res.json({ jsonrpc: "2.0", id, ...obj });
 
   if (method === "initialize") {
@@ -115,6 +118,10 @@ app.post("/sse", (req, res) => {
   if (method === "notifications/initialized") return respond({ result: {} });
   if (method === "tools/list")   return respond({ result: { tools: [] } });
   if (method === "actions/list") return respond({ result: { actions: ACTIONS } });
+  if (method === "actions/call") {
+    if (params?.name !== "search") return respond({ error: { code: -32601, message: "Unknown action" }});
+    return respond({ result: callSearch(params?.arguments || {}) });
+  }
 
   return respond({ error: { code: -32601, message: "Method not found" }});
 });
