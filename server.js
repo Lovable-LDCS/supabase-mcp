@@ -1,7 +1,8 @@
-// server.js — v6.8.0
-// - NEW: MCP Actions API (actions/list, actions/call) with a "search" action
-// - Bridge actions <-> tools so UI can refresh actions successfully
-// - Keep: SSE GET via SDK, POST on /messages and /sse, explicit preflights, permissive CORS, logging, notifications
+// server.js — v6.8.1
+// - Action compatibility shim: add title + parameters to actions
+// - Advertise actions explicitly in initialize.capabilities
+// - Keep: SSE GET via SDK, POST on /sse & /messages, explicit preflights,
+//         permissive CORS, logging, notifications
 
 import "dotenv/config";
 import express from "express";
@@ -103,8 +104,10 @@ const SEARCH_TOOL_DEF = {
 
 const SEARCH_ACTION_DEF = {
   name: "search",
+  title: "Search",                       // <-- added
   description: "Search across your data (stub).",
-  input_schema: SEARCH_INPUT_SCHEMA
+  input_schema: SEARCH_INPUT_SCHEMA,
+  parameters: SEARCH_INPUT_SCHEMA        // <-- added alias some clients expect
 };
 
 // ---- Shared JSON-RPC handler (used by both /messages and /sse) ----
@@ -142,7 +145,7 @@ async function handleJsonRpc(req, res) {
 
     // ---------- Minimal fallbacks ----------
 
-    // Initialize: now advertise tools + actions
+    // Initialize: now explicitly advertise the actions we support
     if (method === "initialize") {
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -152,7 +155,7 @@ async function handleJsonRpc(req, res) {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: {
             tools: {},
-            actions: {}
+            actions: { search: {} }    // <-- explicitly list supported action(s)
           }
         }
       });
@@ -255,7 +258,7 @@ app.get("/messages", (_req, res) =>
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } })
 );
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.8.0" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.8.1" })
 );
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -272,7 +275,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.8.0" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.8.1" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.8.0)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.8.1)`));
