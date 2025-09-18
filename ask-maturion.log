@@ -1,0 +1,44 @@
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:29 char:44
++   Warn ("supabase.env not found at {0} â?" continuing (you may alread ...
++                                            ~~~~~~~~~~
+Unexpected token 'continuing' in expression or statement.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:29 char:43
++   Warn ("supabase.env not found at {0} â?" continuing (you may alread ...
++                                           ~
+Missing closing ')' in expression.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:72 char:21
++ const app = express();
++                     ~
+An expression was expected after '('.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:73 char:14
++ app.use(cors());
++              ~
+An expression was expected after '('.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:74 char:22
++ app.use(express.json());
++                      ~
+An expression was expected after '('.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:78 char:27
++   process.env.SUPABASE_URL,
++                           ~
+Missing argument in parameter list.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:89 char:48
++ mcpServer.setRequestHandler("command/exec_sql", async (request) => {
++                                                ~
+Missing expression after ','.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:89 char:49
++ mcpServer.setRequestHandler("command/exec_sql", async (request) => {
++                                                 ~~~~~
+Unexpected token 'async' in expression or statement.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:89 char:48
++ mcpServer.setRequestHandler("command/exec_sql", async (request) => {
++                                                ~
+Missing closing ')' in expression.
+At C:\Projects\Maturion\supabase-mcp\ask-maturion.ps1:91 char:11
++   if (!sql) return { content: [{ type: "text", text: "Missing SQL par ...
++           ~
+Missing statement block after if ( condition ).
+Not all parse errors were reported.  Correct the reported errors and try again.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : UnexpectedToken
+ 
