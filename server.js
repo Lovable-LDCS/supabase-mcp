@@ -1,7 +1,7 @@
-// server.js — v6.7.0
-// - Add: minimal "search" tool so ChatGPT sees a search action
-// - Add: handle JSON-RPC notification "notifications/initialized" with 204
-// - Keep: SSE GET via SDK, POST on /messages and /sse, explicit preflights, permissive CORS, path logging
+// server.js — v6.8.0
+// - NEW: MCP Actions API (actions/list, actions/call) with a "search" action
+// - Bridge actions <-> tools so UI can refresh actions successfully
+// - Keep: SSE GET via SDK, POST on /messages and /sse, explicit preflights, permissive CORS, logging, notifications
 
 import "dotenv/config";
 import express from "express";
@@ -24,16 +24,17 @@ const mcpServer = new Server(
   { capabilities: {} }
 );
 
-// Report a modern protocol identifier; safe default for MCP clients
+// Protocol version the UI expects
 const PROTOCOL_VERSION = "2024-11-05";
 
+// Common CORS helper
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Session-Id, Authorization, Accept");
 }
 
-// ---- SSE transport resolver ----
+// ---- Resolve SSE transport across SDK layouts ----
 let sseCache = { ok: false, path: null, ctor: null, err: [] };
 async function getSSEServerTransport() {
   if (sseCache.ok) return sseCache;
@@ -58,7 +59,7 @@ async function getSSEServerTransport() {
   return sseCache;
 }
 
-// ---- /sse: preflight + GET (SDK owns headers) + POST (JSON-RPC alias) ----
+// ---- /sse: preflight + GET (SDK headers) + POST (JSON-RPC alias) ----
 app.options("/sse", (req, res) => {
   const asked = req.get("access-control-request-headers") || "<none>";
   console.log("[/sse] preflight, requested headers:", asked);
@@ -74,7 +75,7 @@ app.get("/sse", async (req, res) => {
   const sse = await getSSEServerTransport();
   if (!sse.ok) return res.status(500).json({ error: "SSE transport not available", err: sse.err });
   try {
-    const transport = new sse.ctor(req, res); // emits endpoint: /sse?sessionId=...
+    const transport = new sse.ctor(req, res); // emits endpoint hint /sse?sessionId=...
     await mcpServer.connect(transport);
     console.log("[SSE] connected via", sse.path);
   } catch (e) {
@@ -84,19 +85,26 @@ app.get("/sse", async (req, res) => {
   }
 });
 
-// ---- Minimal "search" tool (stub) ----
-// We expose a tool the UI recognizes. We'll wire it to Supabase next.
+// ---- Tool + Action definitions (mirrored) ----
+const SEARCH_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "What to search for." },
+    topK:  { type: "integer", minimum: 1, maximum: 10, default: 3 }
+  },
+  required: ["query"]
+};
+
 const SEARCH_TOOL_DEF = {
   name: "search",
   description: "Simple text search (stub). Returns placeholder results; to be wired to Supabase.",
-  input_schema: {
-    type: "object",
-    properties: {
-      query: { type: "string", description: "What to search for." },
-      topK: { type: "integer", minimum: 1, maximum: 10, default: 3 }
-    },
-    required: ["query"]
-  }
+  input_schema: SEARCH_INPUT_SCHEMA
+};
+
+const SEARCH_ACTION_DEF = {
+  name: "search",
+  description: "Search across your data (stub).",
+  input_schema: SEARCH_INPUT_SCHEMA
 };
 
 // ---- Shared JSON-RPC handler (used by both /messages and /sse) ----
@@ -104,17 +112,17 @@ async function handleJsonRpc(req, res) {
   try {
     setCors(res);
     const method = req.body?.method || "<no-method>";
-    const id = Object.prototype.hasOwnProperty.call(req.body || {}, "id") ? req.body.id : undefined;
-    const sid = req.get("x-session-id") || req.query.sessionId || "<none>";
+    const hasId   = Object.prototype.hasOwnProperty.call(req.body || {}, "id");
+    const id      = hasId ? req.body.id : undefined;
+    const sid     = req.get("x-session-id") || req.query.sessionId || "<none>";
     console.log(`[${req.path}]`, method, "sid=", sid);
 
-    // JSON-RPC notification (no id): acknowledge with 204
-    if (id === undefined || id === null) {
+    // Notifications (no id): acknowledge with 204
+    if (!hasId || id === null) {
       if (method === "notifications/initialized") {
         console.log(`[${req.path}] notification acknowledged: ${method}`);
         return res.sendStatus(204);
       }
-      // Unknown notifications: ignore politely
       console.log(`[${req.path}] notification ignored: ${method}`);
       return res.sendStatus(204);
     }
@@ -132,8 +140,9 @@ async function handleJsonRpc(req, res) {
       return res.status(200).json(out ?? {});
     }
 
-    // --- Minimal fallbacks for connector creation & basic use ---
+    // ---------- Minimal fallbacks ----------
 
+    // Initialize: now advertise tools + actions
     if (method === "initialize") {
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -141,11 +150,15 @@ async function handleJsonRpc(req, res) {
         result: {
           serverInfo: { name: "supabase-mcp", version: "1.0.0" },
           protocolVersion: PROTOCOL_VERSION,
-          capabilities: {}
+          capabilities: {
+            tools: {},
+            actions: {}
+          }
         }
       });
     }
 
+    // --- Tools API ---
     if (method === "tools/list") {
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -161,7 +174,7 @@ async function handleJsonRpc(req, res) {
         const q = String(args.query || "").trim();
         const topK = Math.min(Math.max(parseInt(args.topK ?? 3, 10) || 3, 1), 10);
         const text = q
-          ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}\n- Next step: connect to Supabase and return real rows.`
+          ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}\n- Next step: connect Supabase and return real rows.`
           : `Search (stub): no query provided.`;
         return res.status(200).json({
           jsonrpc: "2.0",
@@ -169,11 +182,41 @@ async function handleJsonRpc(req, res) {
           result: { content: [{ type: "text", text }] }
         });
       }
-      // Unknown tool name
       return res.status(200).json({
         jsonrpc: "2.0",
         id,
         error: { code: -32601, message: `Tool ${name} not found` }
+      });
+    }
+
+    // --- Actions API (mirrors tools) ---
+    if (method === "actions/list") {
+      return res.status(200).json({
+        jsonrpc: "2.0",
+        id,
+        result: { actions: [SEARCH_ACTION_DEF] }
+      });
+    }
+
+    if (method === "actions/call") {
+      const name = body.params?.name;
+      const args = body.params?.arguments || {};
+      if (name === "search") {
+        const q = String(args.query || "").trim();
+        const topK = Math.min(Math.max(parseInt(args.topK ?? 3, 10) || 3, 1), 10);
+        const text = q
+          ? `Search results for "${q}" (stub)\n- No database wired yet.\n- topK=${topK}`
+          : `Search (stub): no query provided.`;
+        return res.status(200).json({
+          jsonrpc: "2.0",
+          id,
+          result: { content: [{ type: "text", text }] }
+        });
+      }
+      return res.status(200).json({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Action ${name} not found` }
       });
     }
 
@@ -183,6 +226,7 @@ async function handleJsonRpc(req, res) {
       id,
       error: { code: -32601, message: `Method ${method} not found` }
     });
+
   } catch (e) {
     console.error(`[${req.path}] error:`, e);
     return res.status(200).json({
@@ -211,7 +255,7 @@ app.get("/messages", (_req, res) =>
   res.status(200).json({ jsonrpc: "2.0", id: Date.now(), result: { ok: true, route: "direct" } })
 );
 app.get("/debug/env", (_req, res) =>
-  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.7.0" })
+  res.json({ node: process.versions.node, uptimeSec: process.uptime(), patch: "v6.8.0" })
 );
 app.get("/debug/sdk", async (_req, res) => {
   const details = { node: process.versions.node };
@@ -228,7 +272,7 @@ app.get("/debug/sdk", async (_req, res) => {
 
 // Root + 404
 const port = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.7.0" }));
+app.get("/", (_req, res) => res.json({ service: "supabase-mcp", patch: "v6.8.0" }));
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.7.0)`));
+app.listen(port, () => console.log(`MCP server listening on port ${port} (patch v6.8.0)`));
