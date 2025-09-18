@@ -1,4 +1,4 @@
-// server.js — v6.9.2
+// server.js — v6.9.3
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -91,7 +91,7 @@ async function handleJsonRpc(req,res){
       return res.sendStatus(204);
     }
 
-    // always advertise actions here
+    // **Always** advertise actions in initialize
     if(method === "initialize"){
       return res.status(200).json({
         jsonrpc: "2.0",
@@ -104,17 +104,11 @@ async function handleJsonRpc(req,res){
       });
     }
 
-    // prefer SDK if present
-    if(typeof mcpServer.handleHTTP === "function"){
-      const out = await mcpServer.handleHTTP(body, { sessionId: sid !== "<none>" ? sid : undefined });
-      if(out) return res.status(200).json(out);
-    } else if(typeof mcpServer.handleRequest === "function"){
-      const out = await mcpServer.handleRequest(body);
-      if(out) return res.status(200).json(out);
+    // ✅ Short-circuit tools/* so the SDK can't return an empty list
+    if(method === "tools/list"){
+      console.log(`[${req.path}] tools/list -> 1 tool`);
+      return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
     }
-
-    // fallbacks
-    if(method === "tools/list") return res.status(200).json({ jsonrpc:"2.0", id, result:{ tools:[SEARCH_TOOL_DEF] }});
     if(method === "tools/call"){
       const { name } = body.params || {};
       const args = body.params?.arguments || {};
@@ -127,6 +121,16 @@ async function handleJsonRpc(req,res){
       return res.status(200).json({ jsonrpc:"2.0", id, error:{ code:-32601, message:`Tool ${name} not found` }});
     }
 
+    // Prefer SDK for other methods
+    if(typeof mcpServer.handleHTTP === "function"){
+      const out = await mcpServer.handleHTTP(body, { sessionId: sid !== "<none>" ? sid : undefined });
+      if(out) return res.status(200).json(out);
+    } else if(typeof mcpServer.handleRequest === "function"){
+      const out = await mcpServer.handleRequest(body);
+      if(out) return res.status(200).json(out);
+    }
+
+    // Fallbacks for actions/*
     if(method === "actions/list") return res.status(200).json({ jsonrpc:"2.0", id, result:{ actions:[SEARCH_ACTION_DEF] }});
     if(method === "actions/call"){
       const { name } = body.params || {};
@@ -150,7 +154,7 @@ app.options("/messages", (req,res)=>{ const asked=req.get("access-control-reques
 app.post("/messages", handleJsonRpc);
 app.post("/sse", handleJsonRpc);
 
-/* ---------------- REST Actions shim (broad + dual-shape) ---------------- */
+/* ------------- REST Actions shim (same as 6.9.2) ------------- */
 function preflight(path){ return (req,res)=>{ const asked=req.get("access-control-request-headers")||"<none>"; console.log(`[${path}] preflight`, asked); if(asked) res.setHeader("Access-Control-Allow-Headers", asked); setCors(res); res.sendStatus(204); }; }
 function headOk(_req,res){ setCors(res); res.status(200).end(); }
 
@@ -191,11 +195,11 @@ function restCallHandler(name, args, res){
 
 /* ---------------- diagnostics + root ---------------- */
 app.get("/messages", (_req,res)=> res.status(200).json({ jsonrpc:"2.0", id:Date.now(), result:{ ok:true, route:"direct" }}));
-app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.2" }));
+app.get("/debug/env", (_req,res)=> res.json({ node:process.versions.node, uptimeSec:process.uptime(), patch:"v6.9.3" }));
 app.get("/debug/sdk", async (_req,res)=>{ const details={ node:process.versions.node }; try{ const pkg=await import("@modelcontextprotocol/sdk/package.json",{ with:{ type:"json"}}); details.sdkVersion=pkg.default?.version||"unknown"; }catch{ details.sdkVersion="unavailable"; } const sse=await getSSEServerTransport(); details.sseResolved=sse.ok; details.ssePath=sse.path; details.errors=sse.err; res.json(details); });
 
 const port = process.env.PORT || 3000;
-app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.2" }));
+app.get("/", (_req,res)=> res.json({ service:"supabase-mcp", patch:"v6.9.3" }));
 app.use((_req,res)=> { setCors(res); res.status(404).json({ error:"Not found" }); });
 
-app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.9.2)`));
+app.listen(port, ()=> console.log(`MCP server listening on port ${port} (patch v6.9.3)`));
